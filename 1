@@ -1,0 +1,453 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local Networking = require(ReplicatedStorage.SharedModules.Networking)
+local NumberUtils = require(ReplicatedStorage.SharedModules.NumberUtils)
+
+-- ============ DATA ============
+
+local function getFruitsFromBackpack()
+    local fruits = {}
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    local character = LocalPlayer.Character
+    local containers = {}
+    if backpack then table.insert(containers, backpack) end
+    if character then table.insert(containers, character) end
+
+    for _, container in ipairs(containers) do
+        for _, item in ipairs(container:GetChildren()) do
+            local fruitName = item:GetAttribute("FruitName")
+            local fruitId   = item:GetAttribute("Id")
+            local harvested = item:GetAttribute("HarvestedFruit")
+            if fruitName and fruitId and harvested then
+                table.insert(fruits, {
+                    tool     = item,
+                    name     = fruitName,
+                    id       = fruitId,
+                    mutation = item:GetAttribute("Mutation") or "None",
+                    weight   = item:GetAttribute("Weight") or 0,
+                    isProxy  = item:GetAttribute("FruitProxy") == true,
+                    value    = 0,
+                })
+            end
+        end
+    end
+    return fruits
+end
+
+local function fetchValue(fruit)
+    local ok, response = pcall(function()
+        return Networking.NPCS.GetFruitBid:Fire(fruit.id)
+    end)
+    if ok and response then
+        fruit.value = response.CurrentSellValue
+            or response.CurrentOffer
+            or response.BidPrice
+            or 0
+    end
+end
+
+local function promoteToTool(fruitId)
+    local ok = pcall(function()
+        Networking.Backpack.PromoteFruit:Fire(fruitId)
+    end)
+    if not ok then return nil end
+
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    local startT = tick()
+    while tick() - startT < 1.5 do
+        for _, item in ipairs(backpack:GetChildren()) do
+            if item:IsA("Tool")
+                and item:GetAttribute("Id") == fruitId
+                and not item:GetAttribute("FruitProxy") then
+                return item
+            end
+        end
+        task.wait(0.05)
+    end
+    return nil
+end
+
+local function equipFruit(fruit)
+    local item = fruit.tool
+    if not item or not item.Parent then return false end
+
+    if not item:IsA("Tool") or item:GetAttribute("FruitProxy") then
+        local newTool = promoteToTool(fruit.id)
+        if not newTool then return false end
+        item = newTool
+        fruit.tool = newTool
+        fruit.isProxy = false
+    end
+
+    local char = LocalPlayer.Character
+    local hum  = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum then return false end
+
+    if item.Parent == char then
+        item.Parent = LocalPlayer.Backpack
+        return true
+    end
+
+    hum:EquipTool(item)
+    return true
+end
+
+-- ============ UI ============
+
+local old = LocalPlayer.PlayerGui:FindFirstChild("FruitInventoryUI")
+if old then old:Destroy() end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "FruitInventoryUI"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = LocalPlayer.PlayerGui
+
+local main = Instance.new("Frame")
+main.Size = UDim2.new(0, 520, 0, 580)
+main.Position = UDim2.new(0.5, -260, 0.5, -290)
+main.BackgroundColor3 = Color3.fromRGB(22, 24, 30)
+main.BorderSizePixel = 0
+main.Active = true
+main.Draggable = true
+main.Parent = gui
+
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
+local mainStroke = Instance.new("UIStroke", main)
+mainStroke.Color = Color3.fromRGB(60, 65, 75)
+mainStroke.Thickness = 1
+
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1, 0, 0, 42)
+titleBar.BackgroundColor3 = Color3.fromRGB(32, 35, 44)
+titleBar.BorderSizePixel = 0
+titleBar.Parent = main
+Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 10)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -280, 1, 0)
+title.Position = UDim2.new(0, 14, 0, 0)
+title.BackgroundTransparency = 1
+title.Text = "🍓 Fruit Inventory"
+title.TextColor3 = Color3.fromRGB(235, 235, 240)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 15
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = titleBar
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 32, 0, 32)
+closeBtn.Position = UDim2.new(1, -38, 0, 5)
+closeBtn.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+closeBtn.Text = "✕"
+closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 14
+closeBtn.BorderSizePixel = 0
+closeBtn.Parent = titleBar
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 4)
+closeBtn.MouseButton1Click:Connect(function() gui:Destroy() end)
+
+local refreshBtn = Instance.new("TextButton")
+refreshBtn.Size = UDim2.new(0, 90, 0, 32)
+refreshBtn.Position = UDim2.new(1, -134, 0, 5)
+refreshBtn.BackgroundColor3 = Color3.fromRGB(70, 130, 200)
+refreshBtn.Text = "🔄 Refresh"
+refreshBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+refreshBtn.Font = Enum.Font.GothamMedium
+refreshBtn.TextSize = 13
+refreshBtn.BorderSizePixel = 0
+refreshBtn.Parent = titleBar
+Instance.new("UICorner", refreshBtn).CornerRadius = UDim.new(0, 4)
+
+local copyBtn = Instance.new("TextButton")
+copyBtn.Size = UDim2.new(0, 70, 0, 32)
+copyBtn.Position = UDim2.new(1, -210, 0, 5)
+copyBtn.BackgroundColor3 = Color3.fromRGB(120, 90, 200)
+copyBtn.Text = "📋 Copy"
+copyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+copyBtn.Font = Enum.Font.GothamMedium
+copyBtn.TextSize = 13
+copyBtn.BorderSizePixel = 0
+copyBtn.Parent = titleBar
+Instance.new("UICorner", copyBtn).CornerRadius = UDim.new(0, 4)
+
+local searchFrame = Instance.new("Frame")
+searchFrame.Size = UDim2.new(1, -20, 0, 30)
+searchFrame.Position = UDim2.new(0, 10, 0, 50)
+searchFrame.BackgroundColor3 = Color3.fromRGB(30, 33, 42)
+searchFrame.BorderSizePixel = 0
+searchFrame.Parent = main
+Instance.new("UICorner", searchFrame).CornerRadius = UDim.new(0, 5)
+
+local searchBox = Instance.new("TextBox")
+searchBox.Size = UDim2.new(1, -20, 1, 0)
+searchBox.Position = UDim2.new(0, 10, 0, 0)
+searchBox.BackgroundTransparency = 1
+searchBox.Text = ""
+searchBox.PlaceholderText = "🔍 Filter by name or mutation..."
+searchBox.PlaceholderColor3 = Color3.fromRGB(110, 115, 125)
+searchBox.TextColor3 = Color3.fromRGB(230, 230, 235)
+searchBox.Font = Enum.Font.Gotham
+searchBox.TextSize = 12
+searchBox.TextXAlignment = Enum.TextXAlignment.Left
+searchBox.ClearTextOnFocus = false
+searchBox.Parent = searchFrame
+
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, -20, 0, 24)
+header.Position = UDim2.new(0, 10, 0, 86)
+header.BackgroundColor3 = Color3.fromRGB(28, 31, 38)
+header.BorderSizePixel = 0
+header.Parent = main
+Instance.new("UICorner", header).CornerRadius = UDim.new(0, 4)
+
+local function makeHeader(text, xScale, widthScale)
+    local l = Instance.new("TextLabel")
+    l.BackgroundTransparency = 1
+    l.Position = UDim2.new(xScale, 10, 0, 0)
+    l.Size = UDim2.new(widthScale, -10, 1, 0)
+    l.Text = text
+    l.TextColor3 = Color3.fromRGB(140, 145, 155)
+    l.Font = Enum.Font.GothamBold
+    l.TextSize = 10
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Parent = header
+end
+makeHeader("#",        0,    0.06)
+makeHeader("NAME",     0.06, 0.34)
+makeHeader("WEIGHT",   0.40, 0.16)
+makeHeader("MUTATION", 0.56, 0.22)
+makeHeader("VALUE",    0.78, 0.22)
+
+local scroll = Instance.new("ScrollingFrame")
+scroll.Size = UDim2.new(1, -20, 1, -160)
+scroll.Position = UDim2.new(0, 10, 0, 114)
+scroll.BackgroundTransparency = 1
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 4
+scroll.ScrollBarImageColor3 = Color3.fromRGB(100, 105, 115)
+scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scroll.Parent = main
+
+local listLayout = Instance.new("UIListLayout", scroll)
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+listLayout.Padding = UDim.new(0, 2)
+
+local footer = Instance.new("TextLabel")
+footer.Size = UDim2.new(1, -20, 0, 32)
+footer.Position = UDim2.new(0, 10, 1, -40)
+footer.BackgroundColor3 = Color3.fromRGB(30, 33, 42)
+footer.BorderSizePixel = 0
+footer.Text = "Loading..."
+footer.TextColor3 = Color3.fromRGB(220, 220, 225)
+footer.Font = Enum.Font.GothamBold
+footer.TextSize = 12
+footer.Parent = main
+Instance.new("UICorner", footer).CornerRadius = UDim.new(0, 5)
+
+-- ============ ROWS ============
+
+local mutationColors = {
+    Electric   = Color3.fromRGB(255, 230, 80),
+    Gold       = Color3.fromRGB(240, 200, 60),
+    Rainbow    = Color3.fromRGB(255, 130, 220),
+    Frozen     = Color3.fromRGB(120, 200, 255),
+    Wet        = Color3.fromRGB(90, 160, 220),
+    Burnt      = Color3.fromRGB(180, 90, 60),
+    Shocked    = Color3.fromRGB(220, 220, 100),
+    Chilled    = Color3.fromRGB(160, 220, 240),
+    Bloodlit   = Color3.fromRGB(200, 60, 60),
+    Moonlit    = Color3.fromRGB(180, 180, 240),
+    Starstruck = Color3.fromRGB(255, 200, 100),
+}
+
+local allRows = {}
+
+local function rowBaseColor(i)
+    return i % 2 == 0
+        and Color3.fromRGB(30, 33, 40)
+        or  Color3.fromRGB(36, 39, 46)
+end
+
+local function buildRow(fruit, index)
+    local row = Instance.new("TextButton")
+    row.Size = UDim2.new(1, -4, 0, 30)
+    row.BackgroundColor3 = rowBaseColor(index)
+    row.BorderSizePixel = 0
+    row.Text = ""
+    row.AutoButtonColor = false
+    row.LayoutOrder = index
+    row.Parent = scroll
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 4)
+
+    local function cell(text, xScale, widthScale, color)
+        local l = Instance.new("TextLabel")
+        l.BackgroundTransparency = 1
+        l.Position = UDim2.new(xScale, 10, 0, 0)
+        l.Size = UDim2.new(widthScale, -10, 1, 0)
+        l.Text = text
+        l.TextColor3 = color or Color3.fromRGB(225, 225, 230)
+        l.Font = Enum.Font.Gotham
+        l.TextSize = 12
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        l.TextTruncate = Enum.TextTruncate.AtEnd
+        l.Parent = row
+        return l
+    end
+
+    cell(tostring(index) .. ".", 0,    0.06, Color3.fromRGB(150, 155, 165))
+    cell(fruit.name,              0.06, 0.34)
+    cell(string.format("%.2fkg", fruit.weight), 0.40, 0.16)
+    cell(fruit.mutation, 0.56, 0.22, mutationColors[fruit.mutation])
+    cell(NumberUtils.Abbreviate(fruit.value), 0.78, 0.22, Color3.fromRGB(120, 220, 140))
+
+    local baseColor = rowBaseColor(index)
+    row.MouseEnter:Connect(function()
+        row.BackgroundColor3 = Color3.fromRGB(55, 90, 140)
+    end)
+    row.MouseLeave:Connect(function()
+        row.BackgroundColor3 = baseColor
+    end)
+
+    local clicking = false
+    row.MouseButton1Click:Connect(function()
+        if clicking then return end
+        clicking = true
+        row.BackgroundColor3 = Color3.fromRGB(200, 160, 60)
+        local ok = equipFruit(fruit)
+        row.BackgroundColor3 = ok
+            and Color3.fromRGB(80, 180, 100)
+            or  Color3.fromRGB(180, 80, 80)
+        task.wait(0.25)
+        row.BackgroundColor3 = baseColor
+        clicking = false
+    end)
+
+    table.insert(allRows, {row = row, fruit = fruit, index = index})
+end
+
+searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+    local q = searchBox.Text:lower()
+    for _, entry in ipairs(allRows) do
+        local hay = (entry.fruit.name .. " " .. entry.fruit.mutation):lower()
+        entry.row.Visible = (q == "" or hay:find(q, 1, true) ~= nil)
+    end
+end)
+
+-- ============ REFRESH ============
+
+local isRefreshing = false
+
+local function refresh()
+    if isRefreshing then return end
+    isRefreshing = true
+    refreshBtn.Text = "Loading..."
+    refreshBtn.BackgroundColor3 = Color3.fromRGB(100, 100, 110)
+
+    for _, c in ipairs(scroll:GetChildren()) do
+        if c:IsA("TextButton") then c:Destroy() end
+    end
+    allRows = {}
+
+    local fruits = getFruitsFromBackpack()
+    local total = #fruits
+    footer.Text = string.format("Scanning 0/%d...", total)
+
+    if total == 0 then
+        footer.Text = "No harvested fruits found."
+        refreshBtn.Text = "🔄 Refresh"
+        refreshBtn.BackgroundColor3 = Color3.fromRGB(70, 130, 200)
+        isRefreshing = false
+        return
+    end
+
+    local done = 0
+    for _, fruit in ipairs(fruits) do
+        task.spawn(function()
+            fetchValue(fruit)
+            done = done + 1
+        end)
+        task.wait(0.04)
+    end
+
+    local startT = tick()
+    while done < total and tick() - startT < 30 do
+        footer.Text = string.format("Scanning %d/%d...", done, total)
+        task.wait(0.15)
+    end
+
+    table.sort(fruits, function(a, b) return a.value > b.value end)
+
+    local sum = 0
+    for i, fruit in ipairs(fruits) do
+        buildRow(fruit, i)
+        sum = sum + fruit.value
+    end
+
+    footer.Text = string.format("TOTAL: %d fruits  |  Value: %s",
+        total, NumberUtils.Abbreviate(sum))
+
+    refreshBtn.Text = "🔄 Refresh"
+    refreshBtn.BackgroundColor3 = Color3.fromRGB(70, 130, 200)
+    isRefreshing = false
+end
+
+refreshBtn.MouseButton1Click:Connect(refresh)
+
+-- ============ COPY ============
+
+copyBtn.MouseButton1Click:Connect(function()
+    if #allRows == 0 then
+        copyBtn.Text = "Empty!"
+        task.wait(1)
+        copyBtn.Text = "📋 Copy"
+        return
+    end
+
+    local lines = {}
+    table.insert(lines, string.format("%-4s %-25s %-10s %-12s %s",
+        "#", "NAME", "WEIGHT", "MUTATION", "VALUE"))
+    table.insert(lines, string.rep("-", 65))
+
+    local total = 0
+    for i, entry in ipairs(allRows) do
+        local f = entry.fruit
+        table.insert(lines, string.format(
+            "%-4s %-25s %-10s %-12s %s",
+            tostring(i) .. ".",
+            f.name,
+            string.format("%.2fkg", f.weight),
+            f.mutation,
+            NumberUtils.Abbreviate(f.value)
+        ))
+        total = total + f.value
+    end
+
+    table.insert(lines, string.rep("-", 65))
+    table.insert(lines, string.format("TOTAL: %d fruits  |  Value: %s",
+        #allRows, NumberUtils.Abbreviate(total)))
+
+    local output = table.concat(lines, "\n")
+
+    local copied = false
+    pcall(function() if setclipboard then setclipboard(output); copied = true end end)
+    pcall(function() if toclipboard and not copied then toclipboard(output); copied = true end end)
+    pcall(function() if syn and syn.write_clipboard and not copied then syn.write_clipboard(output); copied = true end end)
+
+    pcall(function()
+        if writefile then
+            writefile("fruit-inventory-" .. LocalPlayer.Name .. ".txt", output)
+        end
+    end)
+
+    copyBtn.Text = copied and "✓ Copied!" or "Saved file"
+    copyBtn.BackgroundColor3 = Color3.fromRGB(80, 180, 100)
+    task.wait(1.2)
+    copyBtn.Text = "📋 Copy"
+    copyBtn.BackgroundColor3 = Color3.fromRGB(120, 90, 200)
+end)
+
+refresh()
