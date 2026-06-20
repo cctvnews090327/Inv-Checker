@@ -1,5 +1,9 @@
+-- ============================================================
+--  GAG2 FRUIT INVENTORY + AUTO DROP BY VALUE
+-- ============================================================
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
+local VIM = game:GetService("VirtualInputManager")
 local LocalPlayer = Players.LocalPlayer
 local Networking = require(ReplicatedStorage.SharedModules.Networking)
 local NumberUtils = require(ReplicatedStorage.SharedModules.NumberUtils)
@@ -93,6 +97,125 @@ local function equipFruit(fruit)
     return true
 end
 
+-- Drop a fruit (promote if proxy, equip, backspace)
+local function dropFruit(fruit)
+    local item = fruit.tool
+    if not item or not item.Parent then return false end
+
+    -- promote proxies
+    if not item:IsA("Tool") or item:GetAttribute("FruitProxy") then
+        local newTool = promoteToTool(fruit.id)
+        if not newTool then return false end
+        item = newTool
+        fruit.tool = newTool
+        fruit.isProxy = false
+    end
+
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum then return false end
+
+    -- unequip other tools first
+    for _, t in ipairs(char:GetChildren()) do
+        if t:IsA("Tool") and t ~= item then
+            t.Parent = LocalPlayer.Backpack
+        end
+    end
+
+    -- equip target
+    if item.Parent ~= char then
+        pcall(function() hum:EquipTool(item) end)
+        task.wait(0.1)
+    end
+
+    -- backspace = drop
+    VIM:SendKeyEvent(true,  Enum.KeyCode.Backspace, false, game)
+    task.wait(0.03)
+    VIM:SendKeyEvent(false, Enum.KeyCode.Backspace, false, game)
+    return true
+end
+
+-- Parse "100m", "1.5b", etc.
+local function parseValue(s)
+    s = tostring(s):lower():gsub("[%s,_]", "")
+    if s == "" then return 0 end
+    local n, suf = s:match("^([%d%.]+)([kmbt]?)$")
+    if not n then return tonumber(s) or 0 end
+    n = tonumber(n) or 0
+    local mults = {k=1e3, m=1e6, b=1e9, t=1e12}
+    return n * (mults[suf] or 1)
+end
+
+-- Selection: minimal overshoot, must reach >= target
+local function selectFruitsForTarget(fruits, target)
+    local pool = {}
+    for _, f in ipairs(fruits) do
+        if f.value > 0 then table.insert(pool, f) end
+    end
+    if #pool == 0 then return {}, 0 end
+
+    table.sort(pool, function(a,b) return a.value < b.value end)
+
+    local picked, pickedSet, total = {}, {}, 0
+    for _, f in ipairs(pool) do
+        if total + f.value <= target then
+            table.insert(picked, f); pickedSet[f] = true; total = total + f.value
+        end
+    end
+
+    if total < target then
+        local best, bestNew = nil, math.huge
+        for _, f in ipairs(pool) do
+            if not pickedSet[f] then
+                local nt = total + f.value
+                if nt >= target and nt < bestNew then bestNew, best = nt, f end
+            end
+        end
+        if best then
+            table.insert(picked, best); pickedSet[best] = true; total = bestNew
+        else
+            for _, f in ipairs(pool) do
+                if not pickedSet[f] then
+                    table.insert(picked, f); total = total + f.value
+                end
+            end
+        end
+    end
+
+    -- shrink: remove fruits while staying >= target
+    local improved = true
+    while improved do
+        improved = false
+        for i = #picked, 1, -1 do
+            local p = picked[i]
+            if total - p.value >= target then
+                total = total - p.value; pickedSet[p] = nil
+                table.remove(picked, i); improved = true
+            end
+        end
+    end
+
+    -- swap: reduce overshoot
+    improved = true
+    while improved do
+        improved = false
+        for i, p in ipairs(picked) do
+            for _, f in ipairs(pool) do
+                if not pickedSet[f] then
+                    local nt = total - p.value + f.value
+                    if nt >= target and nt < total then
+                        pickedSet[p] = nil; pickedSet[f] = true
+                        picked[i] = f; total = nt; improved = true; break
+                    end
+                end
+            end
+            if improved then break end
+        end
+    end
+
+    return picked, total
+end
+
 -- ============ UI ============
 
 local old = LocalPlayer.PlayerGui:FindFirstChild("FruitInventoryUI")
@@ -105,8 +228,8 @@ gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.Parent = LocalPlayer.PlayerGui
 
 local main = Instance.new("Frame")
-main.Size = UDim2.new(0, 520, 0, 580)
-main.Position = UDim2.new(0.5, -260, 0.5, -290)
+main.Size = UDim2.new(0, 520, 0, 640)
+main.Position = UDim2.new(0.5, -260, 0.5, -320)
 main.BackgroundColor3 = Color3.fromRGB(22, 24, 30)
 main.BorderSizePixel = 0
 main.Active = true
@@ -195,9 +318,83 @@ searchBox.TextXAlignment = Enum.TextXAlignment.Left
 searchBox.ClearTextOnFocus = false
 searchBox.Parent = searchFrame
 
+-- ===== AUTO DROP PANEL =====
+local dropPanel = Instance.new("Frame")
+dropPanel.Size = UDim2.new(1, -20, 0, 76)
+dropPanel.Position = UDim2.new(0, 10, 0, 86)
+dropPanel.BackgroundColor3 = Color3.fromRGB(30, 33, 42)
+dropPanel.BorderSizePixel = 0
+dropPanel.Parent = main
+Instance.new("UICorner", dropPanel).CornerRadius = UDim.new(0, 5)
+
+local dropTitle = Instance.new("TextLabel")
+dropTitle.Size = UDim2.new(1, -20, 0, 18)
+dropTitle.Position = UDim2.new(0, 10, 0, 4)
+dropTitle.BackgroundTransparency = 1
+dropTitle.Text = "💧 Auto Drop by Value"
+dropTitle.TextColor3 = Color3.fromRGB(180, 200, 255)
+dropTitle.Font = Enum.Font.GothamBold
+dropTitle.TextSize = 12
+dropTitle.TextXAlignment = Enum.TextXAlignment.Left
+dropTitle.Parent = dropPanel
+
+local targetBox = Instance.new("TextBox")
+targetBox.Size = UDim2.new(0, 150, 0, 28)
+targetBox.Position = UDim2.new(0, 10, 0, 26)
+targetBox.BackgroundColor3 = Color3.fromRGB(40, 43, 52)
+targetBox.BorderSizePixel = 0
+targetBox.PlaceholderText = "Target (e.g. 100m)"
+targetBox.PlaceholderColor3 = Color3.fromRGB(110, 115, 125)
+targetBox.Text = ""
+targetBox.TextColor3 = Color3.fromRGB(230, 230, 235)
+targetBox.Font = Enum.Font.Gotham
+targetBox.TextSize = 13
+targetBox.ClearTextOnFocus = false
+targetBox.Parent = dropPanel
+Instance.new("UICorner", targetBox).CornerRadius = UDim.new(0, 4)
+
+local delayBox = Instance.new("TextBox")
+delayBox.Size = UDim2.new(0, 70, 0, 28)
+delayBox.Position = UDim2.new(0, 168, 0, 26)
+delayBox.BackgroundColor3 = Color3.fromRGB(40, 43, 52)
+delayBox.BorderSizePixel = 0
+delayBox.PlaceholderText = "Delay"
+delayBox.PlaceholderColor3 = Color3.fromRGB(110, 115, 125)
+delayBox.Text = "1.0"
+delayBox.TextColor3 = Color3.fromRGB(230, 230, 235)
+delayBox.Font = Enum.Font.Gotham
+delayBox.TextSize = 13
+delayBox.ClearTextOnFocus = false
+delayBox.Parent = dropPanel
+Instance.new("UICorner", delayBox).CornerRadius = UDim.new(0, 4)
+
+local dropBtn = Instance.new("TextButton")
+dropBtn.Size = UDim2.new(0, 120, 0, 28)
+dropBtn.Position = UDim2.new(0, 246, 0, 26)
+dropBtn.BackgroundColor3 = Color3.fromRGB(80, 160, 90)
+dropBtn.BorderSizePixel = 0
+dropBtn.Text = "DROP"
+dropBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+dropBtn.Font = Enum.Font.GothamBold
+dropBtn.TextSize = 13
+dropBtn.Parent = dropPanel
+Instance.new("UICorner", dropBtn).CornerRadius = UDim.new(0, 4)
+
+local dropStatus = Instance.new("TextLabel")
+dropStatus.Size = UDim2.new(1, -20, 0, 16)
+dropStatus.Position = UDim2.new(0, 10, 0, 58)
+dropStatus.BackgroundTransparency = 1
+dropStatus.Text = ""
+dropStatus.TextColor3 = Color3.fromRGB(180, 180, 185)
+dropStatus.Font = Enum.Font.Gotham
+dropStatus.TextSize = 11
+dropStatus.TextXAlignment = Enum.TextXAlignment.Left
+dropStatus.Parent = dropPanel
+
+-- ===== TABLE HEADER =====
 local header = Instance.new("Frame")
 header.Size = UDim2.new(1, -20, 0, 24)
-header.Position = UDim2.new(0, 10, 0, 86)
+header.Position = UDim2.new(0, 10, 0, 170)
 header.BackgroundColor3 = Color3.fromRGB(28, 31, 38)
 header.BorderSizePixel = 0
 header.Parent = main
@@ -222,8 +419,8 @@ makeHeader("MUTATION", 0.56, 0.22)
 makeHeader("VALUE",    0.78, 0.22)
 
 local scroll = Instance.new("ScrollingFrame")
-scroll.Size = UDim2.new(1, -20, 1, -160)
-scroll.Position = UDim2.new(0, 10, 0, 114)
+scroll.Size = UDim2.new(1, -20, 1, -244)
+scroll.Position = UDim2.new(0, 10, 0, 198)
 scroll.BackgroundTransparency = 1
 scroll.BorderSizePixel = 0
 scroll.ScrollBarThickness = 4
@@ -265,6 +462,7 @@ local mutationColors = {
 }
 
 local allRows = {}
+local lastFruits = {}
 
 local function rowBaseColor(i)
     return i % 2 == 0
@@ -361,6 +559,7 @@ local function refresh()
         refreshBtn.Text = "🔄 Refresh"
         refreshBtn.BackgroundColor3 = Color3.fromRGB(70, 130, 200)
         isRefreshing = false
+        lastFruits = {}
         return
     end
 
@@ -380,6 +579,7 @@ local function refresh()
     end
 
     table.sort(fruits, function(a, b) return a.value > b.value end)
+    lastFruits = fruits
 
     local sum = 0
     for i, fruit in ipairs(fruits) do
@@ -396,6 +596,68 @@ local function refresh()
 end
 
 refreshBtn.MouseButton1Click:Connect(refresh)
+
+-- ============ AUTO DROP ============
+
+local isDropping = false
+dropBtn.MouseButton1Click:Connect(function()
+    if isDropping then return end
+    if #lastFruits == 0 then
+        dropStatus.Text = "Refresh inventory first."
+        return
+    end
+
+    local target = parseValue(targetBox.Text)
+    if target <= 0 then
+        dropStatus.Text = "Invalid target."
+        return
+    end
+
+    local perDrop = tonumber(delayBox.Text) or 1.0
+    if perDrop < 0.3 then perDrop = 0.3 end
+
+    isDropping = true
+    dropBtn.Text = "PLANNING..."
+    dropBtn.BackgroundColor3 = Color3.fromRGB(100, 100, 110)
+
+    local picked, total = selectFruitsForTarget(lastFruits, target)
+    if #picked == 0 then
+        dropStatus.Text = "No droppable fruits."
+        dropBtn.Text = "DROP"
+        dropBtn.BackgroundColor3 = Color3.fromRGB(80, 160, 90)
+        isDropping = false
+        return
+    end
+
+    dropStatus.Text = string.format("Plan: %d fruits = %s (target %s)",
+        #picked, NumberUtils.Abbreviate(total), NumberUtils.Abbreviate(target))
+    dropBtn.Text = "DROPPING..."
+
+    task.spawn(function()
+        local dropped, droppedValue = 0, 0
+        for _, f in ipairs(picked) do
+            local ok = dropFruit(f)
+            if ok then
+                dropped = dropped + 1
+                droppedValue = droppedValue + f.value
+                dropStatus.Text = string.format("Dropped %d/%d (%s / %s)",
+                    dropped, #picked,
+                    NumberUtils.Abbreviate(droppedValue),
+                    NumberUtils.Abbreviate(target))
+            end
+            task.wait(perDrop)
+        end
+        dropStatus.Text = string.format("Done! %d/%d = %s (target %s)",
+            dropped, #picked,
+            NumberUtils.Abbreviate(droppedValue),
+            NumberUtils.Abbreviate(target))
+        dropBtn.Text = "DROP"
+        dropBtn.BackgroundColor3 = Color3.fromRGB(80, 160, 90)
+        isDropping = false
+        task.wait(1)
+        refresh()
+    end)
+end)
 
 -- ============ COPY ============
 
