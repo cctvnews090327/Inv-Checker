@@ -1,18 +1,20 @@
 -- ============================================================
---  GAG2 FRUIT INVENTORY + AUTO DROP + AUTO COLLECT DROPPED
---  Merged build
+--  GAG2 FRUIT TOOLKIT - Mobile + Minimize
+--  Inventory + Auto-Drop + Auto-Collect Dropped Fruit
 -- ============================================================
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
 local VIM = game:GetService("VirtualInputManager")
 local LocalPlayer = Players.LocalPlayer
 local Networking = require(ReplicatedStorage.SharedModules.Networking)
 local NumberUtils = require(ReplicatedStorage.SharedModules.NumberUtils)
 
-local FLOOR_LIMIT = 10  -- game's max dropped-fruit limit
+local FLOOR_LIMIT = 10
+local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.MouseEnabled
 
--- ============ DATA ============
+-- =================== DATA ===================
 
 local function getFruitsFromBackpack()
     local fruits = {}
@@ -29,13 +31,11 @@ local function getFruitsFromBackpack()
             local harvested = item:GetAttribute("HarvestedFruit")
             if fruitName and fruitId and harvested then
                 table.insert(fruits, {
-                    tool     = item,
-                    name     = fruitName,
-                    id       = fruitId,
+                    tool = item, name = fruitName, id = fruitId,
                     mutation = item:GetAttribute("Mutation") or "None",
-                    weight   = item:GetAttribute("Weight") or 0,
-                    isProxy  = item:GetAttribute("FruitProxy") == true,
-                    value    = 0,
+                    weight = item:GetAttribute("Weight") or 0,
+                    isProxy = item:GetAttribute("FruitProxy") == true,
+                    value = 0,
                 })
             end
         end
@@ -48,28 +48,19 @@ local function fetchValue(fruit)
         return Networking.NPCS.GetFruitBid:Fire(fruit.id)
     end)
     if ok and response then
-        fruit.value = response.CurrentSellValue
-            or response.CurrentOffer
-            or response.BidPrice
-            or 0
+        fruit.value = response.CurrentSellValue or response.CurrentOffer or response.BidPrice or 0
     end
 end
 
 local function promoteToTool(fruitId)
-    local ok = pcall(function()
-        Networking.Backpack.PromoteFruit:Fire(fruitId)
-    end)
+    local ok = pcall(function() Networking.Backpack.PromoteFruit:Fire(fruitId) end)
     if not ok then return nil end
-
     local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
     local startT = tick()
     while tick() - startT < 1.5 do
         for _, item in ipairs(backpack:GetChildren()) do
-            if item:IsA("Tool")
-                and item:GetAttribute("Id") == fruitId
-                and not item:GetAttribute("FruitProxy") then
-                return item
-            end
+            if item:IsA("Tool") and item:GetAttribute("Id") == fruitId
+                and not item:GetAttribute("FruitProxy") then return item end
         end
         task.wait(0.05)
     end
@@ -79,24 +70,15 @@ end
 local function equipFruit(fruit)
     local item = fruit.tool
     if not item or not item.Parent then return false end
-
     if not item:IsA("Tool") or item:GetAttribute("FruitProxy") then
         local newTool = promoteToTool(fruit.id)
         if not newTool then return false end
-        item = newTool
-        fruit.tool = newTool
-        fruit.isProxy = false
+        item = newTool; fruit.tool = newTool; fruit.isProxy = false
     end
-
     local char = LocalPlayer.Character
-    local hum  = char and char:FindFirstChildOfClass("Humanoid")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
     if not hum then return false end
-
-    if item.Parent == char then
-        item.Parent = LocalPlayer.Backpack
-        return true
-    end
-
+    if item.Parent == char then item.Parent = LocalPlayer.Backpack; return true end
     hum:EquipTool(item)
     return true
 end
@@ -104,64 +86,45 @@ end
 local function dropFruit(fruit)
     local item = fruit.tool
     if not item or not item.Parent then return false end
-
     if not item:IsA("Tool") or item:GetAttribute("FruitProxy") then
         local newTool = promoteToTool(fruit.id)
         if not newTool then return false end
-        item = newTool
-        fruit.tool = newTool
-        fruit.isProxy = false
+        item = newTool; fruit.tool = newTool; fruit.isProxy = false
     end
-
     local char = LocalPlayer.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     if not hum then return false end
-
     for _, t in ipairs(char:GetChildren()) do
-        if t:IsA("Tool") and t ~= item then
-            t.Parent = LocalPlayer.Backpack
-        end
+        if t:IsA("Tool") and t ~= item then t.Parent = LocalPlayer.Backpack end
     end
-
     if item.Parent ~= char then
         pcall(function() hum:EquipTool(item) end)
         task.wait(0.1)
     end
-
-    VIM:SendKeyEvent(true,  Enum.KeyCode.Backspace, false, game)
+    VIM:SendKeyEvent(true, Enum.KeyCode.Backspace, false, game)
     task.wait(0.03)
     VIM:SendKeyEvent(false, Enum.KeyCode.Backspace, false, game)
     return true
 end
-
--- ============ FLOOR FRUIT SCAN ============
 
 local function countFloorFruits()
     local folder = Workspace:FindFirstChild("DroppedItems")
     if not folder then return 0 end
     local count = 0
     for _, c in ipairs(folder:GetChildren()) do
-        if c:IsA("Model") and c.Name:sub(1, 12) == "DroppedItem_" then
-            count = count + 1
-        end
+        if c:IsA("Model") and c.Name:sub(1,12) == "DroppedItem_" then count = count + 1 end
     end
     return count
 end
 
-local function waitForFloorSpace(statusCallback, maxWait)
+local function waitForFloorSpace(cb, maxWait)
     maxWait = maxWait or 60
     local startT = tick()
     while true do
         local n = countFloorFruits()
-        if n < FLOOR_LIMIT then
-            return true, n
-        end
-        if statusCallback then
-            statusCallback(n)
-        end
-        if tick() - startT > maxWait then
-            return false, n
-        end
+        if n < FLOOR_LIMIT then return true, n end
+        if cb then cb(n) end
+        if tick() - startT > maxWait then return false, n end
         task.wait(0.5)
     end
 end
@@ -172,7 +135,7 @@ local function parseValue(s)
     local n, suf = s:match("^([%d%.]+)([kmbt]?)$")
     if not n then return tonumber(s) or 0 end
     n = tonumber(n) or 0
-    local mults = {k=1e3, m=1e6, b=1e9, t=1e12}
+    local mults = {k=1e3,m=1e6,b=1e9,t=1e12}
     return n * (mults[suf] or 1)
 end
 
@@ -182,16 +145,13 @@ local function selectFruitsForTarget(fruits, target)
         if f.value > 0 then table.insert(pool, f) end
     end
     if #pool == 0 then return {}, 0 end
-
     table.sort(pool, function(a,b) return a.value < b.value end)
-
     local picked, pickedSet, total = {}, {}, 0
     for _, f in ipairs(pool) do
         if total + f.value <= target then
             table.insert(picked, f); pickedSet[f] = true; total = total + f.value
         end
     end
-
     if total < target then
         local best, bestNew = nil, math.huge
         for _, f in ipairs(pool) do
@@ -210,7 +170,6 @@ local function selectFruitsForTarget(fruits, target)
             end
         end
     end
-
     local improved = true
     while improved do
         improved = false
@@ -222,7 +181,6 @@ local function selectFruitsForTarget(fruits, target)
             end
         end
     end
-
     improved = true
     while improved do
         improved = false
@@ -239,37 +197,22 @@ local function selectFruitsForTarget(fruits, target)
             if improved then break end
         end
     end
-
     return picked, total
 end
 
--- ============================================================
--- AUTO-COLLECT DROPPED FRUIT (merged from v4 debug)
--- ============================================================
+-- =================== AUTO-COLLECT ===================
 
 local AC = {
-    enabled    = false,
-    alive      = true,
-    collected  = {},
-    failCount  = {},
-    stats      = { total = 0, scans = 0, fires = 0, skips = 0 },
-    homeCFrame = nil,
-    addedConn  = nil,
-    removedConn= nil,
-    -- tunables
-    SCAN_RATE    = 2.0,
-    PER_ITEM_GAP = 0.35,
-    TP_SETTLE    = 0.12,
-    VERIFY_WAIT  = 1.2,
-    MAX_RETRIES  = 2,
-    HOVER_OFFSET = 3,
+    enabled = false, alive = true,
+    collected = {}, failCount = {},
+    stats = { total = 0, scans = 0, fires = 0 },
+    homeCFrame = nil, addedConn = nil, removedConn = nil,
+    SCAN_RATE = 2.0, PER_ITEM_GAP = 0.35, TP_SETTLE = 0.12,
+    VERIFY_WAIT = 1.0, MAX_RETRIES = 2, HOVER_OFFSET = 3,
 }
 
--- kill any previous instance
 if _G.__AutoCollectFruit_Stop then pcall(_G.__AutoCollectFruit_Stop) end
 _G.__AutoCollectFruit_Stop = function() AC.alive = false; AC.enabled = false end
-
-local function ac_log(...) print("[AC]", ...) end
 
 local function ac_getHRP()
     local c = LocalPlayer.Character
@@ -293,21 +236,21 @@ end
 
 local function ac_describeFolder()
     local f = Workspace:FindFirstChild("DroppedItems")
-    if not f then return "no folder" end
-    local total, fruits, pending, done = 0, 0, 0, 0
+    if not f then return "no DroppedItems folder" end
+    local total, fruits, pending = 0, 0, 0
     for _, m in ipairs(f:GetChildren()) do
         total += 1
         if m:GetAttribute("ItemCategory") == "HarvestedFruits" then
             fruits += 1
-            if AC.collected[m] then done += 1 else pending += 1 end
+            if not AC.collected[m] then pending += 1 end
         end
     end
-    return string.format("folder=%d fruits=%d pending=%d done=%d", total, fruits, pending, done)
+    return string.format("floor=%d fruits=%d pending=%d", total, fruits, pending)
 end
 
 local function ac_collect(model)
     if not AC.alive or not AC.enabled then return end
-    if AC.collected[model] then AC.stats.skips += 1; return end
+    if AC.collected[model] then return end
     if not model.Parent then return end
     if model:GetAttribute("ItemCategory") ~= "HarvestedFruits" then return end
 
@@ -331,9 +274,9 @@ local function ac_collect(model)
 
     pcall(function()
         prompt.MaxActivationDistance = 1000
-        prompt.RequiresLineOfSight   = false
-        prompt.HoldDuration          = 0
-        prompt.Enabled               = true
+        prompt.RequiresLineOfSight = false
+        prompt.HoldDuration = 0
+        prompt.Enabled = true
     end)
 
     pcall(function() fireproximityprompt(prompt) end)
@@ -356,7 +299,6 @@ local function ac_collect(model)
         if h and AC.homeCFrame then pcall(function() h.CFrame = AC.homeCFrame end) end
         AC.homeCFrame = nil
     end
-
     task.wait(AC.PER_ITEM_GAP)
 end
 
@@ -364,7 +306,6 @@ local function ac_scanAll()
     AC.stats.scans += 1
     local folder = Workspace:FindFirstChild("DroppedItems")
     if not folder then return end
-
     AC.homeCFrame = nil
     for _, m in ipairs(folder:GetChildren()) do
         if not AC.alive or not AC.enabled then break end
@@ -372,7 +313,6 @@ local function ac_scanAll()
             ac_collect(m)
         end
     end
-
     if AC.homeCFrame then
         local h = ac_getHRP()
         if h then pcall(function() h.CFrame = AC.homeCFrame end) end
@@ -383,35 +323,26 @@ end
 local function ac_start()
     local folder = Workspace:WaitForChild("DroppedItems", 10)
     if not folder then warn("[AC] DroppedItems missing"); return end
-
-    if AC.addedConn   then AC.addedConn:Disconnect()   end
+    if AC.addedConn then AC.addedConn:Disconnect() end
     if AC.removedConn then AC.removedConn:Disconnect() end
-
     AC.addedConn = folder.ChildAdded:Connect(function(m)
-        task.wait(0.2)
-        ac_collect(m)
+        task.wait(0.2); ac_collect(m)
     end)
     AC.removedConn = folder.ChildRemoved:Connect(function(m)
-        if not AC.collected[m] then
-            AC.stats.total += 1
-        end
-        AC.collected[m] = nil
-        AC.failCount[m] = nil
+        if not AC.collected[m] then AC.stats.total += 1 end
+        AC.collected[m] = nil; AC.failCount[m] = nil
     end)
-
-    ac_log("STARTED.", ac_describeFolder())
-    ac_scanAll()
+    print("[AC] STARTED", ac_describeFolder())
+    task.spawn(ac_scanAll)
 end
 
 local function ac_stop()
-    if AC.addedConn   then AC.addedConn:Disconnect();   AC.addedConn   = nil end
+    if AC.addedConn then AC.addedConn:Disconnect(); AC.addedConn = nil end
     if AC.removedConn then AC.removedConn:Disconnect(); AC.removedConn = nil end
-    table.clear(AC.collected)
-    table.clear(AC.failCount)
-    ac_log("STOPPED")
+    table.clear(AC.collected); table.clear(AC.failCount)
+    print("[AC] STOPPED")
 end
 
--- background scan loop
 task.spawn(function()
     while AC.alive do
         task.wait(AC.SCAN_RATE)
@@ -419,9 +350,22 @@ task.spawn(function()
     end
 end)
 
--- ============================================================
--- UI
--- ============================================================
+-- =================== UI ===================
+
+-- mobile-friendly sizing
+local W, H
+if IS_MOBILE then
+    W, H = 360, 560
+else
+    W, H = 520, 760
+end
+
+-- font sizes scale
+local FS_TITLE   = IS_MOBILE and 14 or 15
+local FS_BODY    = IS_MOBILE and 12 or 12
+local FS_SMALL   = IS_MOBILE and 11 or 11
+local FS_BTN     = IS_MOBILE and 13 or 13
+local BTN_H      = IS_MOBILE and 34 or 32
 
 local old = LocalPlayer.PlayerGui:FindFirstChild("FruitInventoryUI")
 if old then old:Destroy() end
@@ -430,22 +374,47 @@ local gui = Instance.new("ScreenGui")
 gui.Name = "FruitInventoryUI"
 gui.ResetOnSpawn = false
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.IgnoreGuiInset = true
 gui.Parent = LocalPlayer.PlayerGui
 
+-- =========== FLOATING MINIMIZED BUBBLE ===========
+local bubble = Instance.new("TextButton")
+bubble.Name = "Bubble"
+bubble.Size = UDim2.new(0, 56, 0, 56)
+bubble.Position = UDim2.new(0, 20, 0.5, -28)
+bubble.BackgroundColor3 = Color3.fromRGB(70, 130, 200)
+bubble.Text = "🍓"
+bubble.TextColor3 = Color3.fromRGB(255,255,255)
+bubble.Font = Enum.Font.GothamBold
+bubble.TextSize = 26
+bubble.BorderSizePixel = 0
+bubble.AutoButtonColor = true
+bubble.Visible = false
+bubble.Active = true
+bubble.Draggable = true
+bubble.Parent = gui
+Instance.new("UICorner", bubble).CornerRadius = UDim.new(1, 0)
+local bubbleStroke = Instance.new("UIStroke", bubble)
+bubbleStroke.Color = Color3.fromRGB(255,255,255)
+bubbleStroke.Thickness = 2
+bubbleStroke.Transparency = 0.4
+
+-- =========== MAIN WINDOW ===========
 local main = Instance.new("Frame")
-main.Size = UDim2.new(0, 520, 0, 740)        -- taller to fit AC panel
-main.Position = UDim2.new(0.5, -260, 0.5, -370)
+main.Name = "Main"
+main.Size = UDim2.new(0, W, 0, H)
+main.Position = UDim2.new(0.5, -W/2, 0.5, -H/2)
 main.BackgroundColor3 = Color3.fromRGB(22, 24, 30)
 main.BorderSizePixel = 0
 main.Active = true
 main.Draggable = true
 main.Parent = gui
-
 Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
 local mainStroke = Instance.new("UIStroke", main)
 mainStroke.Color = Color3.fromRGB(60, 65, 75)
 mainStroke.Thickness = 1
 
+-- title bar (clickable area for minimize via dedicated button)
 local titleBar = Instance.new("Frame")
 titleBar.Size = UDim2.new(1, 0, 0, 42)
 titleBar.BackgroundColor3 = Color3.fromRGB(32, 35, 44)
@@ -454,61 +423,57 @@ titleBar.Parent = main
 Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 10)
 
 local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -280, 1, 0)
-title.Position = UDim2.new(0, 14, 0, 0)
+title.Size = UDim2.new(1, -160, 1, 0)
+title.Position = UDim2.new(0, 12, 0, 0)
 title.BackgroundTransparency = 1
-title.Text = "🍓 Fruit Inventory"
-title.TextColor3 = Color3.fromRGB(235, 235, 240)
+title.Text = "🍓 Fruit Toolkit"
+title.TextColor3 = Color3.fromRGB(235,235,240)
 title.Font = Enum.Font.GothamBold
-title.TextSize = 15
+title.TextSize = FS_TITLE
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.Parent = titleBar
 
-local closeBtn = Instance.new("TextButton")
-closeBtn.Size = UDim2.new(0, 32, 0, 32)
-closeBtn.Position = UDim2.new(1, -38, 0, 5)
-closeBtn.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
-closeBtn.Text = "✕"
-closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-closeBtn.Font = Enum.Font.GothamBold
-closeBtn.TextSize = 14
-closeBtn.BorderSizePixel = 0
-closeBtn.Parent = titleBar
-Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 4)
+local function makeTitleBtn(text, xOffset, bgColor, width)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0, width or 32, 0, 32)
+    b.Position = UDim2.new(1, xOffset, 0, 5)
+    b.BackgroundColor3 = bgColor
+    b.Text = text
+    b.TextColor3 = Color3.fromRGB(255,255,255)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 14
+    b.BorderSizePixel = 0
+    b.Parent = titleBar
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 4)
+    return b
+end
+
+local closeBtn   = makeTitleBtn("✕", -38, Color3.fromRGB(200,60,60))
+local minBtn     = makeTitleBtn("−", -74, Color3.fromRGB(220,170,60))
+local refreshBtn = makeTitleBtn("🔄", -110, Color3.fromRGB(70,130,200))
+local copyBtn    = makeTitleBtn("📋", -146, Color3.fromRGB(120,90,200))
+
 closeBtn.MouseButton1Click:Connect(function()
-    AC.enabled = false
-    ac_stop()
-    gui:Destroy()
+    AC.enabled = false; ac_stop(); gui:Destroy()
 end)
 
-local refreshBtn = Instance.new("TextButton")
-refreshBtn.Size = UDim2.new(0, 90, 0, 32)
-refreshBtn.Position = UDim2.new(1, -134, 0, 5)
-refreshBtn.BackgroundColor3 = Color3.fromRGB(70, 130, 200)
-refreshBtn.Text = "🔄 Refresh"
-refreshBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-refreshBtn.Font = Enum.Font.GothamMedium
-refreshBtn.TextSize = 13
-refreshBtn.BorderSizePixel = 0
-refreshBtn.Parent = titleBar
-Instance.new("UICorner", refreshBtn).CornerRadius = UDim.new(0, 4)
+local function minimize()
+    main.Visible = false
+    bubble.Visible = true
+end
+local function restore()
+    bubble.Visible = false
+    main.Visible = true
+end
 
-local copyBtn = Instance.new("TextButton")
-copyBtn.Size = UDim2.new(0, 70, 0, 32)
-copyBtn.Position = UDim2.new(1, -210, 0, 5)
-copyBtn.BackgroundColor3 = Color3.fromRGB(120, 90, 200)
-copyBtn.Text = "📋 Copy"
-copyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-copyBtn.Font = Enum.Font.GothamMedium
-copyBtn.TextSize = 13
-copyBtn.BorderSizePixel = 0
-copyBtn.Parent = titleBar
-Instance.new("UICorner", copyBtn).CornerRadius = UDim.new(0, 4)
+minBtn.MouseButton1Click:Connect(minimize)
+bubble.MouseButton1Click:Connect(restore)
 
+-- =========== SEARCH ===========
 local searchFrame = Instance.new("Frame")
 searchFrame.Size = UDim2.new(1, -20, 0, 30)
 searchFrame.Position = UDim2.new(0, 10, 0, 50)
-searchFrame.BackgroundColor3 = Color3.fromRGB(30, 33, 42)
+searchFrame.BackgroundColor3 = Color3.fromRGB(30,33,42)
 searchFrame.BorderSizePixel = 0
 searchFrame.Parent = main
 Instance.new("UICorner", searchFrame).CornerRadius = UDim.new(0, 5)
@@ -519,95 +484,102 @@ searchBox.Position = UDim2.new(0, 10, 0, 0)
 searchBox.BackgroundTransparency = 1
 searchBox.Text = ""
 searchBox.PlaceholderText = "🔍 Filter by name or mutation..."
-searchBox.PlaceholderColor3 = Color3.fromRGB(110, 115, 125)
-searchBox.TextColor3 = Color3.fromRGB(230, 230, 235)
+searchBox.PlaceholderColor3 = Color3.fromRGB(110,115,125)
+searchBox.TextColor3 = Color3.fromRGB(230,230,235)
 searchBox.Font = Enum.Font.Gotham
-searchBox.TextSize = 12
+searchBox.TextSize = FS_BODY
 searchBox.TextXAlignment = Enum.TextXAlignment.Left
 searchBox.ClearTextOnFocus = false
 searchBox.Parent = searchFrame
 
--- ===== AUTO DROP PANEL =====
+-- =========== AUTO DROP PANEL ===========
 local dropPanel = Instance.new("Frame")
-dropPanel.Size = UDim2.new(1, -20, 0, 96)
+dropPanel.Size = UDim2.new(1, -20, 0, 100)
 dropPanel.Position = UDim2.new(0, 10, 0, 86)
-dropPanel.BackgroundColor3 = Color3.fromRGB(30, 33, 42)
+dropPanel.BackgroundColor3 = Color3.fromRGB(30,33,42)
 dropPanel.BorderSizePixel = 0
 dropPanel.Parent = main
 Instance.new("UICorner", dropPanel).CornerRadius = UDim.new(0, 5)
 
 local dropTitle = Instance.new("TextLabel")
-dropTitle.Size = UDim2.new(1, -20, 0, 18)
+dropTitle.Size = UDim2.new(1, -160, 0, 18)
 dropTitle.Position = UDim2.new(0, 10, 0, 4)
 dropTitle.BackgroundTransparency = 1
 dropTitle.Text = "💧 Auto Drop by Value"
-dropTitle.TextColor3 = Color3.fromRGB(180, 200, 255)
+dropTitle.TextColor3 = Color3.fromRGB(180,200,255)
 dropTitle.Font = Enum.Font.GothamBold
-dropTitle.TextSize = 12
+dropTitle.TextSize = FS_BODY
 dropTitle.TextXAlignment = Enum.TextXAlignment.Left
 dropTitle.Parent = dropPanel
 
 local floorLabel = Instance.new("TextLabel")
-floorLabel.Size = UDim2.new(0, 150, 0, 16)
-floorLabel.Position = UDim2.new(1, -160, 0, 5)
+floorLabel.Size = UDim2.new(0, 150, 0, 18)
+floorLabel.Position = UDim2.new(1, -160, 0, 4)
 floorLabel.BackgroundTransparency = 1
 floorLabel.Text = "Floor: 0/" .. FLOOR_LIMIT
-floorLabel.TextColor3 = Color3.fromRGB(180, 220, 180)
+floorLabel.TextColor3 = Color3.fromRGB(180,220,180)
 floorLabel.Font = Enum.Font.GothamMedium
-floorLabel.TextSize = 11
+floorLabel.TextSize = FS_SMALL
 floorLabel.TextXAlignment = Enum.TextXAlignment.Right
 floorLabel.Parent = dropPanel
 
+-- responsive layout for drop controls
+local controlsY = 26
+local availW = W - 40  -- panel inner width
+local targetW = math.floor(availW * 0.42)
+local delayW  = math.floor(availW * 0.22)
+local dropBtnW = availW - targetW - delayW - 12
+
 local targetBox = Instance.new("TextBox")
-targetBox.Size = UDim2.new(0, 150, 0, 28)
-targetBox.Position = UDim2.new(0, 10, 0, 26)
-targetBox.BackgroundColor3 = Color3.fromRGB(40, 43, 52)
+targetBox.Size = UDim2.new(0, targetW, 0, BTN_H)
+targetBox.Position = UDim2.new(0, 10, 0, controlsY)
+targetBox.BackgroundColor3 = Color3.fromRGB(40,43,52)
 targetBox.BorderSizePixel = 0
-targetBox.PlaceholderText = "Target (e.g. 100m)"
-targetBox.PlaceholderColor3 = Color3.fromRGB(110, 115, 125)
+targetBox.PlaceholderText = "Target (100m)"
+targetBox.PlaceholderColor3 = Color3.fromRGB(110,115,125)
 targetBox.Text = ""
-targetBox.TextColor3 = Color3.fromRGB(230, 230, 235)
+targetBox.TextColor3 = Color3.fromRGB(230,230,235)
 targetBox.Font = Enum.Font.Gotham
-targetBox.TextSize = 13
+targetBox.TextSize = FS_BTN
 targetBox.ClearTextOnFocus = false
 targetBox.Parent = dropPanel
 Instance.new("UICorner", targetBox).CornerRadius = UDim.new(0, 4)
 
 local delayBox = Instance.new("TextBox")
-delayBox.Size = UDim2.new(0, 70, 0, 28)
-delayBox.Position = UDim2.new(0, 168, 0, 26)
-delayBox.BackgroundColor3 = Color3.fromRGB(40, 43, 52)
+delayBox.Size = UDim2.new(0, delayW, 0, BTN_H)
+delayBox.Position = UDim2.new(0, 10 + targetW + 6, 0, controlsY)
+delayBox.BackgroundColor3 = Color3.fromRGB(40,43,52)
 delayBox.BorderSizePixel = 0
 delayBox.PlaceholderText = "Delay"
-delayBox.PlaceholderColor3 = Color3.fromRGB(110, 115, 125)
+delayBox.PlaceholderColor3 = Color3.fromRGB(110,115,125)
 delayBox.Text = "1.0"
-delayBox.TextColor3 = Color3.fromRGB(230, 230, 235)
+delayBox.TextColor3 = Color3.fromRGB(230,230,235)
 delayBox.Font = Enum.Font.Gotham
-delayBox.TextSize = 13
+delayBox.TextSize = FS_BTN
 delayBox.ClearTextOnFocus = false
 delayBox.Parent = dropPanel
 Instance.new("UICorner", delayBox).CornerRadius = UDim.new(0, 4)
 
 local dropBtn = Instance.new("TextButton")
-dropBtn.Size = UDim2.new(0, 120, 0, 28)
-dropBtn.Position = UDim2.new(0, 246, 0, 26)
-dropBtn.BackgroundColor3 = Color3.fromRGB(80, 160, 90)
+dropBtn.Size = UDim2.new(0, dropBtnW, 0, BTN_H)
+dropBtn.Position = UDim2.new(0, 10 + targetW + 6 + delayW + 6, 0, controlsY)
+dropBtn.BackgroundColor3 = Color3.fromRGB(80,160,90)
 dropBtn.BorderSizePixel = 0
 dropBtn.Text = "DROP"
-dropBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+dropBtn.TextColor3 = Color3.fromRGB(255,255,255)
 dropBtn.Font = Enum.Font.GothamBold
-dropBtn.TextSize = 13
+dropBtn.TextSize = FS_BTN
 dropBtn.Parent = dropPanel
 Instance.new("UICorner", dropBtn).CornerRadius = UDim.new(0, 4)
 
 local dropStatus = Instance.new("TextLabel")
-dropStatus.Size = UDim2.new(1, -20, 0, 32)
-dropStatus.Position = UDim2.new(0, 10, 0, 60)
+dropStatus.Size = UDim2.new(1, -20, 0, 34)
+dropStatus.Position = UDim2.new(0, 10, 0, controlsY + BTN_H + 4)
 dropStatus.BackgroundTransparency = 1
 dropStatus.Text = ""
-dropStatus.TextColor3 = Color3.fromRGB(180, 180, 185)
+dropStatus.TextColor3 = Color3.fromRGB(180,180,185)
 dropStatus.Font = Enum.Font.Gotham
-dropStatus.TextSize = 11
+dropStatus.TextSize = FS_SMALL
 dropStatus.TextXAlignment = Enum.TextXAlignment.Left
 dropStatus.TextYAlignment = Enum.TextYAlignment.Top
 dropStatus.TextWrapped = true
@@ -621,11 +593,11 @@ task.spawn(function()
     end
 end)
 
--- ===== AUTO COLLECT PANEL ===== (NEW)
+-- =========== AUTO COLLECT PANEL ===========
 local acPanel = Instance.new("Frame")
-acPanel.Size = UDim2.new(1, -20, 0, 70)
-acPanel.Position = UDim2.new(0, 10, 0, 190)
-acPanel.BackgroundColor3 = Color3.fromRGB(30, 33, 42)
+acPanel.Size = UDim2.new(1, -20, 0, 76)
+acPanel.Position = UDim2.new(0, 10, 0, 194)
+acPanel.BackgroundColor3 = Color3.fromRGB(30,33,42)
 acPanel.BorderSizePixel = 0
 acPanel.Parent = main
 Instance.new("UICorner", acPanel).CornerRadius = UDim.new(0, 5)
@@ -635,68 +607,72 @@ acTitle.Size = UDim2.new(1, -20, 0, 18)
 acTitle.Position = UDim2.new(0, 10, 0, 4)
 acTitle.BackgroundTransparency = 1
 acTitle.Text = "🍎 Auto-Collect Dropped Fruit"
-acTitle.TextColor3 = Color3.fromRGB(255, 200, 150)
+acTitle.TextColor3 = Color3.fromRGB(255,200,150)
 acTitle.Font = Enum.Font.GothamBold
-acTitle.TextSize = 12
+acTitle.TextSize = FS_BODY
 acTitle.TextXAlignment = Enum.TextXAlignment.Left
 acTitle.Parent = acPanel
 
 local acToggleBtn = Instance.new("TextButton")
-acToggleBtn.Size = UDim2.new(0, 90, 0, 30)
+acToggleBtn.Size = UDim2.new(0, 100, 0, BTN_H)
 acToggleBtn.Position = UDim2.new(0, 10, 0, 28)
-acToggleBtn.BackgroundColor3 = Color3.fromRGB(55, 60, 70)
+acToggleBtn.BackgroundColor3 = Color3.fromRGB(55,60,70)
 acToggleBtn.BorderSizePixel = 0
 acToggleBtn.Text = "OFF"
-acToggleBtn.TextColor3 = Color3.fromRGB(235, 235, 240)
+acToggleBtn.TextColor3 = Color3.fromRGB(235,235,240)
 acToggleBtn.Font = Enum.Font.GothamBold
-acToggleBtn.TextSize = 13
+acToggleBtn.TextSize = FS_BTN
 acToggleBtn.Parent = acPanel
 Instance.new("UICorner", acToggleBtn).CornerRadius = UDim.new(0, 4)
 
 local acStatus = Instance.new("TextLabel")
-acStatus.Size = UDim2.new(1, -120, 0, 30)
-acStatus.Position = UDim2.new(0, 108, 0, 28)
+acStatus.Size = UDim2.new(1, -130, 0, 38)
+acStatus.Position = UDim2.new(0, 118, 0, 28)
 acStatus.BackgroundTransparency = 1
 acStatus.Text = "Idle"
-acStatus.TextColor3 = Color3.fromRGB(180, 180, 185)
+acStatus.TextColor3 = Color3.fromRGB(180,180,185)
 acStatus.Font = Enum.Font.Gotham
-acStatus.TextSize = 11
+acStatus.TextSize = FS_SMALL
 acStatus.TextXAlignment = Enum.TextXAlignment.Left
 acStatus.TextYAlignment = Enum.TextYAlignment.Top
 acStatus.TextWrapped = true
 acStatus.Parent = acPanel
 
-local function refreshACBtn()
-    acToggleBtn.Text = AC.enabled and "ON" or "OFF"
-    acToggleBtn.BackgroundColor3 = AC.enabled
-        and Color3.fromRGB(60, 170, 90)
-        or Color3.fromRGB(55, 60, 70)
-end
-
 acToggleBtn.MouseButton1Click:Connect(function()
     AC.enabled = not AC.enabled
-    if AC.enabled then ac_start() else ac_stop() end
-    refreshACBtn()
+    if AC.enabled then
+        ac_start()
+        acToggleBtn.Text = "ON"
+        acToggleBtn.BackgroundColor3 = Color3.fromRGB(60,170,90)
+    else
+        ac_stop()
+        acToggleBtn.Text = "OFF"
+        acToggleBtn.BackgroundColor3 = Color3.fromRGB(55,60,70)
+    end
 end)
 
--- live AC status updater
 task.spawn(function()
     while gui.Parent do
         if AC.enabled then
-            acStatus.Text = string.format("Got: %d  Fires: %d  Scans: %d\n%s",
+            acStatus.Text = string.format("Got:%d  Fires:%d  Scans:%d\n%s",
                 AC.stats.total, AC.stats.fires, AC.stats.scans, ac_describeFolder())
+            -- also show indicator on bubble
+            bubble.BackgroundColor3 = Color3.fromRGB(60,170,90)
         else
-            acStatus.Text = "Idle"
+            acStatus.Text = "Idle  -  tap ON to start"
+            bubble.BackgroundColor3 = Color3.fromRGB(70,130,200)
         end
         task.wait(0.5)
     end
 end)
 
--- ===== TABLE HEADER =====
+-- =========== TABLE ===========
+local TABLE_Y = 278
+
 local header = Instance.new("Frame")
 header.Size = UDim2.new(1, -20, 0, 24)
-header.Position = UDim2.new(0, 10, 0, 268)
-header.BackgroundColor3 = Color3.fromRGB(28, 31, 38)
+header.Position = UDim2.new(0, 10, 0, TABLE_Y)
+header.BackgroundColor3 = Color3.fromRGB(28,31,38)
 header.BorderSizePixel = 0
 header.Parent = main
 Instance.new("UICorner", header).CornerRadius = UDim.new(0, 4)
@@ -704,29 +680,38 @@ Instance.new("UICorner", header).CornerRadius = UDim.new(0, 4)
 local function makeHeader(text, xScale, widthScale)
     local l = Instance.new("TextLabel")
     l.BackgroundTransparency = 1
-    l.Position = UDim2.new(xScale, 10, 0, 0)
-    l.Size = UDim2.new(widthScale, -10, 1, 0)
+    l.Position = UDim2.new(xScale, 8, 0, 0)
+    l.Size = UDim2.new(widthScale, -8, 1, 0)
     l.Text = text
-    l.TextColor3 = Color3.fromRGB(140, 145, 155)
+    l.TextColor3 = Color3.fromRGB(140,145,155)
     l.Font = Enum.Font.GothamBold
     l.TextSize = 10
     l.TextXAlignment = Enum.TextXAlignment.Left
     l.Parent = header
 end
-makeHeader("#",        0,    0.06)
-makeHeader("NAME",     0.06, 0.34)
-makeHeader("WEIGHT",   0.40, 0.16)
-makeHeader("MUTATION", 0.56, 0.22)
-makeHeader("VALUE",    0.78, 0.22)
+
+if IS_MOBILE then
+    -- compact: hide weight column on mobile
+    makeHeader("#",        0,    0.08)
+    makeHeader("NAME",     0.08, 0.40)
+    makeHeader("MUTATION", 0.48, 0.26)
+    makeHeader("VALUE",    0.74, 0.26)
+else
+    makeHeader("#",        0,    0.06)
+    makeHeader("NAME",     0.06, 0.34)
+    makeHeader("WEIGHT",   0.40, 0.16)
+    makeHeader("MUTATION", 0.56, 0.22)
+    makeHeader("VALUE",    0.78, 0.22)
+end
 
 local scroll = Instance.new("ScrollingFrame")
-scroll.Size = UDim2.new(1, -20, 1, -342)
-scroll.Position = UDim2.new(0, 10, 0, 296)
+scroll.Size = UDim2.new(1, -20, 1, -(TABLE_Y + 28 + 44))
+scroll.Position = UDim2.new(0, 10, 0, TABLE_Y + 28)
 scroll.BackgroundTransparency = 1
 scroll.BorderSizePixel = 0
-scroll.ScrollBarThickness = 4
-scroll.ScrollBarImageColor3 = Color3.fromRGB(100, 105, 115)
-scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+scroll.ScrollBarThickness = IS_MOBILE and 6 or 4
+scroll.ScrollBarImageColor3 = Color3.fromRGB(100,105,115)
+scroll.CanvasSize = UDim2.new(0,0,0,0)
 scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 scroll.Parent = main
 
@@ -737,17 +722,16 @@ listLayout.Padding = UDim.new(0, 2)
 local footer = Instance.new("TextLabel")
 footer.Size = UDim2.new(1, -20, 0, 32)
 footer.Position = UDim2.new(0, 10, 1, -40)
-footer.BackgroundColor3 = Color3.fromRGB(30, 33, 42)
+footer.BackgroundColor3 = Color3.fromRGB(30,33,42)
 footer.BorderSizePixel = 0
 footer.Text = "Loading..."
-footer.TextColor3 = Color3.fromRGB(220, 220, 225)
+footer.TextColor3 = Color3.fromRGB(220,220,225)
 footer.Font = Enum.Font.GothamBold
-footer.TextSize = 12
+footer.TextSize = FS_BODY
 footer.Parent = main
 Instance.new("UICorner", footer).CornerRadius = UDim.new(0, 5)
 
--- ============ ROWS ============
-
+-- =========== ROWS ===========
 local mutationColors = {
     Electric = Color3.fromRGB(255,230,80), Gold = Color3.fromRGB(240,200,60),
     Rainbow = Color3.fromRGB(255,130,220), Frozen = Color3.fromRGB(120,200,255),
@@ -757,16 +741,14 @@ local mutationColors = {
     Starstruck = Color3.fromRGB(255,200,100),
 }
 
-local allRows = {}
-local lastFruits = {}
-
+local allRows, lastFruits = {}, {}
 local function rowBaseColor(i)
     return i % 2 == 0 and Color3.fromRGB(30,33,40) or Color3.fromRGB(36,39,46)
 end
 
 local function buildRow(fruit, index)
     local row = Instance.new("TextButton")
-    row.Size = UDim2.new(1, -4, 0, 30)
+    row.Size = UDim2.new(1, -4, 0, IS_MOBILE and 34 or 30)
     row.BackgroundColor3 = rowBaseColor(index)
     row.BorderSizePixel = 0
     row.Text = ""
@@ -778,23 +760,30 @@ local function buildRow(fruit, index)
     local function cell(text, xScale, widthScale, color)
         local l = Instance.new("TextLabel")
         l.BackgroundTransparency = 1
-        l.Position = UDim2.new(xScale, 10, 0, 0)
-        l.Size = UDim2.new(widthScale, -10, 1, 0)
+        l.Position = UDim2.new(xScale, 8, 0, 0)
+        l.Size = UDim2.new(widthScale, -8, 1, 0)
         l.Text = text
         l.TextColor3 = color or Color3.fromRGB(225,225,230)
         l.Font = Enum.Font.Gotham
-        l.TextSize = 12
+        l.TextSize = FS_BODY
         l.TextXAlignment = Enum.TextXAlignment.Left
         l.TextTruncate = Enum.TextTruncate.AtEnd
         l.Parent = row
         return l
     end
 
-    cell(tostring(index)..".", 0, 0.06, Color3.fromRGB(150,155,165))
-    cell(fruit.name, 0.06, 0.34)
-    cell(string.format("%.2fkg", fruit.weight), 0.40, 0.16)
-    cell(fruit.mutation, 0.56, 0.22, mutationColors[fruit.mutation])
-    cell(NumberUtils.Abbreviate(fruit.value), 0.78, 0.22, Color3.fromRGB(120,220,140))
+    if IS_MOBILE then
+        cell(tostring(index)..".", 0, 0.08, Color3.fromRGB(150,155,165))
+        cell(fruit.name, 0.08, 0.40)
+        cell(fruit.mutation, 0.48, 0.26, mutationColors[fruit.mutation])
+        cell(NumberUtils.Abbreviate(fruit.value), 0.74, 0.26, Color3.fromRGB(120,220,140))
+    else
+        cell(tostring(index)..".", 0, 0.06, Color3.fromRGB(150,155,165))
+        cell(fruit.name, 0.06, 0.34)
+        cell(string.format("%.2fkg", fruit.weight), 0.40, 0.16)
+        cell(fruit.mutation, 0.56, 0.22, mutationColors[fruit.mutation])
+        cell(NumberUtils.Abbreviate(fruit.value), 0.78, 0.22, Color3.fromRGB(120,220,140))
+    end
 
     local baseColor = rowBaseColor(index)
     row.MouseEnter:Connect(function() row.BackgroundColor3 = Color3.fromRGB(55,90,140) end)
@@ -812,7 +801,7 @@ local function buildRow(fruit, index)
         clicking = false
     end)
 
-    table.insert(allRows, {row = row, fruit = fruit, index = index})
+    table.insert(allRows, {row=row, fruit=fruit, index=index})
 end
 
 searchBox:GetPropertyChangedSignal("Text"):Connect(function()
@@ -823,14 +812,12 @@ searchBox:GetPropertyChangedSignal("Text"):Connect(function()
     end
 end)
 
--- ============ REFRESH ============
-
+-- =========== REFRESH ===========
 local isRefreshing = false
-
 local function refresh()
     if isRefreshing then return end
     isRefreshing = true
-    refreshBtn.Text = "Loading..."
+    refreshBtn.Text = "..."
     refreshBtn.BackgroundColor3 = Color3.fromRGB(100,100,110)
 
     for _, c in ipairs(scroll:GetChildren()) do
@@ -844,7 +831,7 @@ local function refresh()
 
     if total == 0 then
         footer.Text = "No harvested fruits found."
-        refreshBtn.Text = "🔄 Refresh"
+        refreshBtn.Text = "🔄"
         refreshBtn.BackgroundColor3 = Color3.fromRGB(70,130,200)
         isRefreshing = false
         lastFruits = {}
@@ -872,18 +859,17 @@ local function refresh()
         sum = sum + fruit.value
     end
 
-    footer.Text = string.format("TOTAL: %d fruits  |  Value: %s",
+    footer.Text = string.format("TOTAL: %d  |  %s",
         total, NumberUtils.Abbreviate(sum))
 
-    refreshBtn.Text = "🔄 Refresh"
+    refreshBtn.Text = "🔄"
     refreshBtn.BackgroundColor3 = Color3.fromRGB(70,130,200)
     isRefreshing = false
 end
 
 refreshBtn.MouseButton1Click:Connect(refresh)
 
--- ============ AUTO DROP ============
-
+-- =========== AUTO DROP ===========
 local isDropping = false
 dropBtn.MouseButton1Click:Connect(function()
     if isDropping then return end
@@ -891,18 +877,13 @@ dropBtn.MouseButton1Click:Connect(function()
         dropStatus.Text = "Refresh inventory first."
         return
     end
-
     local target = parseValue(targetBox.Text)
-    if target <= 0 then
-        dropStatus.Text = "Invalid target."
-        return
-    end
-
+    if target <= 0 then dropStatus.Text = "Invalid target."; return end
     local perDrop = tonumber(delayBox.Text) or 1.0
     if perDrop < 0.3 then perDrop = 0.3 end
 
     isDropping = true
-    dropBtn.Text = "PLANNING..."
+    dropBtn.Text = "..."
     dropBtn.BackgroundColor3 = Color3.fromRGB(100,100,110)
 
     local picked, total = selectFruitsForTarget(lastFruits, target)
@@ -914,24 +895,22 @@ dropBtn.MouseButton1Click:Connect(function()
         return
     end
 
-    dropStatus.Text = string.format("Plan: %d fruits = %s (target %s)",
-        #picked, NumberUtils.Abbreviate(total), NumberUtils.Abbreviate(target))
-    dropBtn.Text = "DROPPING..."
+    dropStatus.Text = string.format("Plan: %d fruits = %s",
+        #picked, NumberUtils.Abbreviate(total))
+    dropBtn.Text = "..."
 
     task.spawn(function()
         local dropped, droppedValue = 0, 0
         for _, f in ipairs(picked) do
             local floorN = countFloorFruits()
             if floorN >= FLOOR_LIMIT then
-                dropStatus.Text = string.format("Floor full (%d/%d). Waiting for pickup...",
-                    floorN, FLOOR_LIMIT)
+                dropStatus.Text = string.format("Floor full. Waiting...")
                 local ok2 = waitForFloorSpace(function(n)
-                    dropStatus.Text = string.format("Floor full (%d/%d). Waiting...  [%d/%d done]",
+                    dropStatus.Text = string.format("Floor %d/%d. Waiting...  [%d/%d]",
                         n, FLOOR_LIMIT, dropped, #picked)
                 end, 120)
                 if not ok2 then
-                    dropStatus.Text = string.format("Timed out waiting for floor space. Stopped at %d/%d.",
-                        dropped, #picked)
+                    dropStatus.Text = string.format("Timeout at %d/%d.", dropped, #picked)
                     break
                 end
             end
@@ -940,57 +919,41 @@ dropBtn.MouseButton1Click:Connect(function()
             if ok then
                 dropped = dropped + 1
                 droppedValue = droppedValue + f.value
-                dropStatus.Text = string.format("Dropped %d/%d (%s / %s)  Floor:%d/%d",
-                    dropped, #picked,
-                    NumberUtils.Abbreviate(droppedValue),
-                    NumberUtils.Abbreviate(target),
+                dropStatus.Text = string.format("Dropped %d/%d  (%s)  Floor:%d/%d",
+                    dropped, #picked, NumberUtils.Abbreviate(droppedValue),
                     countFloorFruits(), FLOOR_LIMIT)
             end
             task.wait(perDrop)
         end
-        dropStatus.Text = string.format("Done! %d/%d = %s (target %s)",
-            dropped, #picked,
-            NumberUtils.Abbreviate(droppedValue),
-            NumberUtils.Abbreviate(target))
+        dropStatus.Text = string.format("Done! %d/%d = %s",
+            dropped, #picked, NumberUtils.Abbreviate(droppedValue))
         dropBtn.Text = "DROP"
         dropBtn.BackgroundColor3 = Color3.fromRGB(80,160,90)
         isDropping = false
-        task.wait(1)
-        refresh()
+        task.wait(1); refresh()
     end)
 end)
 
--- ============ COPY ============
-
+-- =========== COPY ===========
 copyBtn.MouseButton1Click:Connect(function()
-    if #allRows == 0 then
-        copyBtn.Text = "Empty!"
-        task.wait(1); copyBtn.Text = "📋 Copy"; return
-    end
+    if #allRows == 0 then return end
     local lines = {}
-    table.insert(lines, string.format("%-4s %-25s %-10s %-12s %s","#","NAME","WEIGHT","MUTATION","VALUE"))
-    table.insert(lines, string.rep("-", 65))
+    table.insert(lines, string.format("%-4s %-22s %-9s %-12s %s","#","NAME","WEIGHT","MUTATION","VALUE"))
+    table.insert(lines, string.rep("-", 62))
     local total = 0
     for i, entry in ipairs(allRows) do
         local f = entry.fruit
-        table.insert(lines, string.format("%-4s %-25s %-10s %-12s %s",
+        table.insert(lines, string.format("%-4s %-22s %-9s %-12s %s",
             tostring(i)..".", f.name, string.format("%.2fkg", f.weight),
             f.mutation, NumberUtils.Abbreviate(f.value)))
         total = total + f.value
     end
-    table.insert(lines, string.rep("-", 65))
-    table.insert(lines, string.format("TOTAL: %d fruits  |  Value: %s",
-        #allRows, NumberUtils.Abbreviate(total)))
+    table.insert(lines, string.rep("-", 62))
+    table.insert(lines, string.format("TOTAL: %d  |  %s", #allRows, NumberUtils.Abbreviate(total)))
     local output = table.concat(lines, "\n")
-    local copied = false
-    pcall(function() if setclipboard then setclipboard(output); copied = true end end)
-    pcall(function() if toclipboard and not copied then toclipboard(output); copied = true end end)
+    pcall(function() if setclipboard then setclipboard(output) end end)
     pcall(function() if writefile then writefile("fruit-inventory-"..LocalPlayer.Name..".txt", output) end end)
-    copyBtn.Text = copied and "✓ Copied!" or "Saved file"
-    copyBtn.BackgroundColor3 = Color3.fromRGB(80,180,100)
-    task.wait(1.2)
-    copyBtn.Text = "📋 Copy"
-    copyBtn.BackgroundColor3 = Color3.fromRGB(120,90,200)
 end)
 
 refresh()
+print("[FruitToolkit] Loaded. Mobile:", IS_MOBILE)
