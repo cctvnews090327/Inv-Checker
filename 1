@@ -1,5 +1,6 @@
 -- ============================================================
---  GAG2 FRUIT INVENTORY + AUTO DROP BY VALUE  (v5 - floor check)
+--  GAG2 FRUIT INVENTORY + AUTO DROP + AUTO COLLECT DROPPED
+--  Merged build
 -- ============================================================
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
@@ -134,9 +135,6 @@ local function dropFruit(fruit)
 end
 
 -- ============ FLOOR FRUIT SCAN ============
--- Counts dropped fruits in workspace. Looks for Models/Tools with
--- FruitName or Fruit attribute, AND optionally an Owner attribute
--- matching the local player (only count our own drops if owned).
 
 local function countFloorFruits()
     local folder = Workspace:FindFirstChild("DroppedItems")
@@ -150,7 +148,6 @@ local function countFloorFruits()
     return count
 end
 
--- Wait until floor has space for one more drop
 local function waitForFloorSpace(statusCallback, maxWait)
     maxWait = maxWait or 60
     local startT = tick()
@@ -246,7 +243,185 @@ local function selectFruitsForTarget(fruits, target)
     return picked, total
 end
 
--- ============ UI ============
+-- ============================================================
+-- AUTO-COLLECT DROPPED FRUIT (merged from v4 debug)
+-- ============================================================
+
+local AC = {
+    enabled    = false,
+    alive      = true,
+    collected  = {},
+    failCount  = {},
+    stats      = { total = 0, scans = 0, fires = 0, skips = 0 },
+    homeCFrame = nil,
+    addedConn  = nil,
+    removedConn= nil,
+    -- tunables
+    SCAN_RATE    = 2.0,
+    PER_ITEM_GAP = 0.35,
+    TP_SETTLE    = 0.12,
+    VERIFY_WAIT  = 1.2,
+    MAX_RETRIES  = 2,
+    HOVER_OFFSET = 3,
+}
+
+-- kill any previous instance
+if _G.__AutoCollectFruit_Stop then pcall(_G.__AutoCollectFruit_Stop) end
+_G.__AutoCollectFruit_Stop = function() AC.alive = false; AC.enabled = false end
+
+local function ac_log(...) print("[AC]", ...) end
+
+local function ac_getHRP()
+    local c = LocalPlayer.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function ac_getModelPos(model)
+    if model.PrimaryPart then return model.PrimaryPart.Position end
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("BasePart") then return d.Position end
+    end
+    local ok, cf = pcall(function() return model:GetPivot() end)
+    if ok then return cf.Position end
+end
+
+local function ac_findPrompt(model)
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then return d end
+    end
+end
+
+local function ac_describeFolder()
+    local f = Workspace:FindFirstChild("DroppedItems")
+    if not f then return "no folder" end
+    local total, fruits, pending, done = 0, 0, 0, 0
+    for _, m in ipairs(f:GetChildren()) do
+        total += 1
+        if m:GetAttribute("ItemCategory") == "HarvestedFruits" then
+            fruits += 1
+            if AC.collected[m] then done += 1 else pending += 1 end
+        end
+    end
+    return string.format("folder=%d fruits=%d pending=%d done=%d", total, fruits, pending, done)
+end
+
+local function ac_collect(model)
+    if not AC.alive or not AC.enabled then return end
+    if AC.collected[model] then AC.stats.skips += 1; return end
+    if not model.Parent then return end
+    if model:GetAttribute("ItemCategory") ~= "HarvestedFruits" then return end
+
+    local prompt = ac_findPrompt(model)
+    if not prompt then return end
+    local fruitPos = ac_getModelPos(model)
+    if not fruitPos then return end
+    local hrp = ac_getHRP()
+    if not hrp then return end
+
+    local savedHere = false
+    if not AC.homeCFrame then
+        AC.homeCFrame = hrp.CFrame
+        savedHere = true
+    end
+
+    pcall(function()
+        hrp.CFrame = CFrame.new(fruitPos + Vector3.new(0, AC.HOVER_OFFSET, 0))
+    end)
+    task.wait(AC.TP_SETTLE)
+
+    pcall(function()
+        prompt.MaxActivationDistance = 1000
+        prompt.RequiresLineOfSight   = false
+        prompt.HoldDuration          = 0
+        prompt.Enabled               = true
+    end)
+
+    pcall(function() fireproximityprompt(prompt) end)
+    AC.stats.fires += 1
+
+    task.wait(AC.VERIFY_WAIT)
+
+    if not model.Parent then
+        AC.collected[model] = true
+        AC.failCount[model] = nil
+    else
+        AC.failCount[model] = (AC.failCount[model] or 0) + 1
+        if AC.failCount[model] >= AC.MAX_RETRIES then
+            AC.collected[model] = true
+        end
+    end
+
+    if savedHere then
+        local h = ac_getHRP()
+        if h and AC.homeCFrame then pcall(function() h.CFrame = AC.homeCFrame end) end
+        AC.homeCFrame = nil
+    end
+
+    task.wait(AC.PER_ITEM_GAP)
+end
+
+local function ac_scanAll()
+    AC.stats.scans += 1
+    local folder = Workspace:FindFirstChild("DroppedItems")
+    if not folder then return end
+
+    AC.homeCFrame = nil
+    for _, m in ipairs(folder:GetChildren()) do
+        if not AC.alive or not AC.enabled then break end
+        if not AC.collected[m] and m:GetAttribute("ItemCategory") == "HarvestedFruits" then
+            ac_collect(m)
+        end
+    end
+
+    if AC.homeCFrame then
+        local h = ac_getHRP()
+        if h then pcall(function() h.CFrame = AC.homeCFrame end) end
+        AC.homeCFrame = nil
+    end
+end
+
+local function ac_start()
+    local folder = Workspace:WaitForChild("DroppedItems", 10)
+    if not folder then warn("[AC] DroppedItems missing"); return end
+
+    if AC.addedConn   then AC.addedConn:Disconnect()   end
+    if AC.removedConn then AC.removedConn:Disconnect() end
+
+    AC.addedConn = folder.ChildAdded:Connect(function(m)
+        task.wait(0.2)
+        ac_collect(m)
+    end)
+    AC.removedConn = folder.ChildRemoved:Connect(function(m)
+        if not AC.collected[m] then
+            AC.stats.total += 1
+        end
+        AC.collected[m] = nil
+        AC.failCount[m] = nil
+    end)
+
+    ac_log("STARTED.", ac_describeFolder())
+    ac_scanAll()
+end
+
+local function ac_stop()
+    if AC.addedConn   then AC.addedConn:Disconnect();   AC.addedConn   = nil end
+    if AC.removedConn then AC.removedConn:Disconnect(); AC.removedConn = nil end
+    table.clear(AC.collected)
+    table.clear(AC.failCount)
+    ac_log("STOPPED")
+end
+
+-- background scan loop
+task.spawn(function()
+    while AC.alive do
+        task.wait(AC.SCAN_RATE)
+        if AC.enabled then ac_scanAll() end
+    end
+end)
+
+-- ============================================================
+-- UI
+-- ============================================================
 
 local old = LocalPlayer.PlayerGui:FindFirstChild("FruitInventoryUI")
 if old then old:Destroy() end
@@ -258,8 +433,8 @@ gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.Parent = LocalPlayer.PlayerGui
 
 local main = Instance.new("Frame")
-main.Size = UDim2.new(0, 520, 0, 660)
-main.Position = UDim2.new(0.5, -260, 0.5, -330)
+main.Size = UDim2.new(0, 520, 0, 740)        -- taller to fit AC panel
+main.Position = UDim2.new(0.5, -260, 0.5, -370)
 main.BackgroundColor3 = Color3.fromRGB(22, 24, 30)
 main.BorderSizePixel = 0
 main.Active = true
@@ -300,7 +475,11 @@ closeBtn.TextSize = 14
 closeBtn.BorderSizePixel = 0
 closeBtn.Parent = titleBar
 Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 4)
-closeBtn.MouseButton1Click:Connect(function() gui:Destroy() end)
+closeBtn.MouseButton1Click:Connect(function()
+    AC.enabled = false
+    ac_stop()
+    gui:Destroy()
+end)
 
 local refreshBtn = Instance.new("TextButton")
 refreshBtn.Size = UDim2.new(0, 90, 0, 32)
@@ -436,128 +615,87 @@ dropStatus.Parent = dropPanel
 
 -- live floor counter
 task.spawn(function()
-        local dropped, droppedValue = 0, 0
+    while gui.Parent do
+        floorLabel.Text = string.format("Floor: %d/%d", countFloorFruits(), FLOOR_LIMIT)
+        task.wait(0.5)
+    end
+end)
 
-        -- Tight floor-check helper: blocks until floor < limit
-        local function waitForSpace()
-            while countFloorFruits() >= FLOOR_LIMIT do
-                dropStatus.Text = string.format("Floor FULL (%d/%d). Waiting...  [%d/%d done, %s]",
-                    countFloorFruits(), FLOOR_LIMIT, dropped, #picked,
-                    NumberUtils.Abbreviate(droppedValue))
-                task.wait(0.2)
-            end
+-- ===== AUTO COLLECT PANEL ===== (NEW)
+local acPanel = Instance.new("Frame")
+acPanel.Size = UDim2.new(1, -20, 0, 70)
+acPanel.Position = UDim2.new(0, 10, 0, 190)
+acPanel.BackgroundColor3 = Color3.fromRGB(30, 33, 42)
+acPanel.BorderSizePixel = 0
+acPanel.Parent = main
+Instance.new("UICorner", acPanel).CornerRadius = UDim.new(0, 5)
+
+local acTitle = Instance.new("TextLabel")
+acTitle.Size = UDim2.new(1, -20, 0, 18)
+acTitle.Position = UDim2.new(0, 10, 0, 4)
+acTitle.BackgroundTransparency = 1
+acTitle.Text = "🍎 Auto-Collect Dropped Fruit"
+acTitle.TextColor3 = Color3.fromRGB(255, 200, 150)
+acTitle.Font = Enum.Font.GothamBold
+acTitle.TextSize = 12
+acTitle.TextXAlignment = Enum.TextXAlignment.Left
+acTitle.Parent = acPanel
+
+local acToggleBtn = Instance.new("TextButton")
+acToggleBtn.Size = UDim2.new(0, 90, 0, 30)
+acToggleBtn.Position = UDim2.new(0, 10, 0, 28)
+acToggleBtn.BackgroundColor3 = Color3.fromRGB(55, 60, 70)
+acToggleBtn.BorderSizePixel = 0
+acToggleBtn.Text = "OFF"
+acToggleBtn.TextColor3 = Color3.fromRGB(235, 235, 240)
+acToggleBtn.Font = Enum.Font.GothamBold
+acToggleBtn.TextSize = 13
+acToggleBtn.Parent = acPanel
+Instance.new("UICorner", acToggleBtn).CornerRadius = UDim.new(0, 4)
+
+local acStatus = Instance.new("TextLabel")
+acStatus.Size = UDim2.new(1, -120, 0, 30)
+acStatus.Position = UDim2.new(0, 108, 0, 28)
+acStatus.BackgroundTransparency = 1
+acStatus.Text = "Idle"
+acStatus.TextColor3 = Color3.fromRGB(180, 180, 185)
+acStatus.Font = Enum.Font.Gotham
+acStatus.TextSize = 11
+acStatus.TextXAlignment = Enum.TextXAlignment.Left
+acStatus.TextYAlignment = Enum.TextYAlignment.Top
+acStatus.TextWrapped = true
+acStatus.Parent = acPanel
+
+local function refreshACBtn()
+    acToggleBtn.Text = AC.enabled and "ON" or "OFF"
+    acToggleBtn.BackgroundColor3 = AC.enabled
+        and Color3.fromRGB(60, 170, 90)
+        or Color3.fromRGB(55, 60, 70)
+end
+
+acToggleBtn.MouseButton1Click:Connect(function()
+    AC.enabled = not AC.enabled
+    if AC.enabled then ac_start() else ac_stop() end
+    refreshACBtn()
+end)
+
+-- live AC status updater
+task.spawn(function()
+    while gui.Parent do
+        if AC.enabled then
+            acStatus.Text = string.format("Got: %d  Fires: %d  Scans: %d\n%s",
+                AC.stats.total, AC.stats.fires, AC.stats.scans, ac_describeFolder())
+        else
+            acStatus.Text = "Idle"
         end
-
-        for _, f in ipairs(picked) do
-            -- Pre-equip wait: floor must have space
-            waitForSpace()
-
-            -- Promote + equip the fruit (this takes time, floor could fill during it)
-            local item = f.tool
-            if not item or not item.Parent then
-                continue
-            end
-            if not item:IsA("Tool") or item:GetAttribute("FruitProxy") then
-                local newTool = promoteToTool(f.id)
-                if not newTool then continue end
-                item = newTool
-                f.tool = newTool
-                f.isProxy = false
-            end
-
-            local char = LocalPlayer.Character
-            local hum = char and char:FindFirstChildOfClass("Humanoid")
-            if not hum then continue end
-
-            -- Unequip other tools
-            for _, t in ipairs(char:GetChildren()) do
-                if t:IsA("Tool") and t ~= item then
-                    t.Parent = LocalPlayer.Backpack
-                end
-            end
-            if item.Parent ~= char then
-                pcall(function() hum:EquipTool(item) end)
-                task.wait(0.1)
-            end
-
-            -- CRITICAL: re-check floor RIGHT before firing backspace.
-            -- If it filled up while we were equipping, wait.
-            waitForSpace()
-
-            -- Snapshot floor count, fire drop, then verify the count increased
-            local beforeCount = countFloorFruits()
-            VIM:SendKeyEvent(true,  Enum.KeyCode.Backspace, false, game)
-            task.wait(0.03)
-            VIM:SendKeyEvent(false, Enum.KeyCode.Backspace, false, game)
-
-            -- Wait briefly to confirm the drop registered server-side
-            local confirmed = false
-            local t0 = tick()
-            while tick() - t0 < 1.5 do
-                if countFloorFruits() > beforeCount then
-                    confirmed = true
-                    break
-                end
-                task.wait(0.05)
-            end
-
-            if confirmed then
-                dropped = dropped + 1
-                droppedValue = droppedValue + f.value
-                dropStatus.Text = string.format("Dropped %d/%d (%s / %s)  Floor:%d/%d",
-                    dropped, #picked,
-                    NumberUtils.Abbreviate(droppedValue),
-                    NumberUtils.Abbreviate(target),
-                    countFloorFruits(), FLOOR_LIMIT)
-            else
-                -- Drop didn't register (probably blocked by floor limit server-side).
-                -- Put tool back and retry the same fruit after waiting for space.
-                dropStatus.Text = "Drop didn't register — retrying after floor clears..."
-                if item.Parent == char then
-                    item.Parent = LocalPlayer.Backpack
-                end
-                waitForSpace()
-                -- decrement so the for loop "retries" — we do this by
-                -- pushing the fruit back onto the list. But simpler: just inline retry.
-                local retryItem = f.tool
-                if retryItem and retryItem.Parent then
-                    if not retryItem:IsA("Tool") or retryItem:GetAttribute("FruitProxy") then
-                        retryItem = promoteToTool(f.id)
-                    end
-                    if retryItem then
-                        pcall(function() hum:EquipTool(retryItem) end)
-                        task.wait(0.1)
-                        waitForSpace()
-                        VIM:SendKeyEvent(true,  Enum.KeyCode.Backspace, false, game)
-                        task.wait(0.03)
-                        VIM:SendKeyEvent(false, Enum.KeyCode.Backspace, false, game)
-                        task.wait(0.3)
-                        if countFloorFruits() > 0 then
-                            dropped = dropped + 1
-                            droppedValue = droppedValue + f.value
-                        end
-                    end
-                end
-            end
-
-            task.wait(perDrop)
-        end
-
-        dropStatus.Text = string.format("Done! %d/%d = %s (target %s)",
-            dropped, #picked,
-            NumberUtils.Abbreviate(droppedValue),
-            NumberUtils.Abbreviate(target))
-        dropBtn.Text = "DROP"
-        dropBtn.BackgroundColor3 = Color3.fromRGB(80,160,90)
-        isDropping = false
-        task.wait(1)
-        refresh()
-    end)
+        task.wait(0.5)
+    end
+end)
 
 -- ===== TABLE HEADER =====
 local header = Instance.new("Frame")
 header.Size = UDim2.new(1, -20, 0, 24)
-header.Position = UDim2.new(0, 10, 0, 190)
+header.Position = UDim2.new(0, 10, 0, 268)
 header.BackgroundColor3 = Color3.fromRGB(28, 31, 38)
 header.BorderSizePixel = 0
 header.Parent = main
@@ -582,8 +720,8 @@ makeHeader("MUTATION", 0.56, 0.22)
 makeHeader("VALUE",    0.78, 0.22)
 
 local scroll = Instance.new("ScrollingFrame")
-scroll.Size = UDim2.new(1, -20, 1, -264)
-scroll.Position = UDim2.new(0, 10, 0, 218)
+scroll.Size = UDim2.new(1, -20, 1, -342)
+scroll.Position = UDim2.new(0, 10, 0, 296)
 scroll.BackgroundTransparency = 1
 scroll.BorderSizePixel = 0
 scroll.ScrollBarThickness = 4
@@ -782,8 +920,7 @@ dropBtn.MouseButton1Click:Connect(function()
 
     task.spawn(function()
         local dropped, droppedValue = 0, 0
-        for i, f in ipairs(picked) do
-            -- Wait for floor space before each drop
+        for _, f in ipairs(picked) do
             local floorN = countFloorFruits()
             if floorN >= FLOOR_LIMIT then
                 dropStatus.Text = string.format("Floor full (%d/%d). Waiting for pickup...",
@@ -791,7 +928,7 @@ dropBtn.MouseButton1Click:Connect(function()
                 local ok2 = waitForFloorSpace(function(n)
                     dropStatus.Text = string.format("Floor full (%d/%d). Waiting...  [%d/%d done]",
                         n, FLOOR_LIMIT, dropped, #picked)
-                end, 120) -- wait up to 2 minutes
+                end, 120)
                 if not ok2 then
                     dropStatus.Text = string.format("Timed out waiting for floor space. Stopped at %d/%d.",
                         dropped, #picked)
