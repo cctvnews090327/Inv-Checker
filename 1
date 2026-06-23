@@ -1,6 +1,7 @@
 -- ============================================================
---  GAG2 FRUIT TOOLKIT - Mobile + Minimize
---  Inventory + Auto-Drop (by value / by count) + Auto-Collect
+--  GAG2 FRUIT TOOLKIT
+--  Inventory + Auto-Favorite + Auto-Drop (dir + ignore favorites)
+--  + Auto-Collect dropped fruit
 -- ============================================================
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
@@ -13,6 +14,48 @@ local NumberUtils = require(ReplicatedStorage.SharedModules.NumberUtils)
 
 local FLOOR_LIMIT = 10
 local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.MouseEnabled
+
+-- =================== FAVORITE HELPERS ===================
+-- The exact remote name is game-version dependent. We try a few likely
+-- candidates and remember which one worked.
+local FAV_REMOTE_CANDIDATES = {
+    "FavoriteFruit", "ToggleFavorite", "FavouriteFruit", "ToggleFavourite",
+    "SetFavorite", "FavoriteItem",
+}
+local FAV_ATTR_CANDIDATES = { "Favorited", "IsFavorite", "Favorite", "Favourited", "IsFavourited" }
+
+local function getFavAttr(tool)
+    for _, a in ipairs(FAV_ATTR_CANDIDATES) do
+        local v = tool:GetAttribute(a)
+        if v ~= nil then return v, a end
+    end
+    return nil, nil
+end
+
+local function isFavorited(tool)
+    local v = getFavAttr(tool)
+    return v == true
+end
+
+local _favRemoteCached = nil
+local function callFavoriteRemote(fruitId)
+    if _favRemoteCached then
+        local ok = pcall(function() _favRemoteCached:Fire(fruitId) end)
+        return ok
+    end
+    if not Networking.Backpack then return false end
+    for _, name in ipairs(FAV_REMOTE_CANDIDATES) do
+        local remote = Networking.Backpack[name]
+        if remote then
+            local ok = pcall(function() remote:Fire(fruitId) end)
+            if ok then
+                _favRemoteCached = remote
+                return true
+            end
+        end
+    end
+    return false
+end
 
 -- =================== DATA ===================
 
@@ -35,6 +78,7 @@ local function getFruitsFromBackpack()
                     mutation = item:GetAttribute("Mutation") or "None",
                     weight = item:GetAttribute("Weight") or 0,
                     isProxy = item:GetAttribute("FruitProxy") == true,
+                    favorited = isFavorited(item),
                     value = 0,
                 })
             end
@@ -179,80 +223,57 @@ local function parseValue(s)
     return n * (mults[suf] or 1)
 end
 
-local function selectFruitsForTarget(fruits, target)
+-- Filter out favorites, return a fresh pool
+local function nonFavPool(fruits)
     local pool = {}
     for _, f in ipairs(fruits) do
-        if f.value > 0 then table.insert(pool, f) end
+        if not f.favorited then table.insert(pool, f) end
     end
-    if #pool == 0 then return {}, 0 end
-    table.sort(pool, function(a,b) return a.value < b.value end)
-    local picked, pickedSet, total = {}, {}, 0
-    for _, f in ipairs(pool) do
-        if total + f.value <= target then
-            table.insert(picked, f); pickedSet[f] = true; total = total + f.value
-        end
-    end
-    if total < target then
-        local best, bestNew = nil, math.huge
-        for _, f in ipairs(pool) do
-            if not pickedSet[f] then
-                local nt = total + f.value
-                if nt >= target and nt < bestNew then bestNew, best = nt, f end
-            end
-        end
-        if best then
-            table.insert(picked, best); pickedSet[best] = true; total = bestNew
-        else
-            for _, f in ipairs(pool) do
-                if not pickedSet[f] then
-                    table.insert(picked, f); total = total + f.value
-                end
-            end
-        end
-    end
-    local improved = true
-    while improved do
-        improved = false
-        for i = #picked, 1, -1 do
-            local p = picked[i]
-            if total - p.value >= target then
-                total = total - p.value; pickedSet[p] = nil
-                table.remove(picked, i); improved = true
-            end
-        end
-    end
-    improved = true
-    while improved do
-        improved = false
-        for i, p in ipairs(picked) do
-            for _, f in ipairs(pool) do
-                if not pickedSet[f] then
-                    local nt = total - p.value + f.value
-                    if nt >= target and nt < total then
-                        pickedSet[p] = nil; pickedSet[f] = true
-                        picked[i] = f; total = nt; improved = true; break
-                    end
-                end
-            end
-            if improved then break end
-        end
-    end
-    return picked, total
+    return pool
 end
 
--- Pick N lowest-value fruits, ascending. value==0 sorts last.
-local function selectLowestN(fruits, n)
-    local pool = {}
-    for _, f in ipairs(fruits) do table.insert(pool, f) end
+-- Sort by value, direction: "asc" (low→high) or "desc" (high→low).
+-- value==0 always sorts to the end (unknown bid → skip last).
+local function sortPool(pool, direction)
     table.sort(pool, function(a, b)
         local av = (a.value and a.value > 0) and a.value or math.huge
         local bv = (b.value and b.value > 0) and b.value or math.huge
-        return av < bv
+        if direction == "desc" then
+            -- treat huge (unknown) as smaller so it goes last
+            if av == math.huge and bv ~= math.huge then return false end
+            if bv == math.huge and av ~= math.huge then return true end
+            return av > bv
+        else
+            return av < bv
+        end
     end)
+end
+
+-- Pick N fruits in the given direction, skipping favorites.
+local function selectN(fruits, n, direction)
+    local pool = nonFavPool(fruits)
+    sortPool(pool, direction)
     local picked, total = {}, 0
     for i = 1, math.min(n, #pool) do
         table.insert(picked, pool[i])
         total = total + (pool[i].value or 0)
+    end
+    return picked, total
+end
+
+-- Pick fruits to reach a value target, in the given direction, skipping favorites.
+-- Greedy: walk pool in direction, accumulate until target reached.
+local function selectByValue(fruits, target, direction)
+    local pool = nonFavPool(fruits)
+    -- only keep ones with known >0 value for value-target math
+    local filt = {}
+    for _, f in ipairs(pool) do if f.value and f.value > 0 then table.insert(filt, f) end end
+    sortPool(filt, direction)
+    local picked, total = {}, 0
+    for _, f in ipairs(filt) do
+        table.insert(picked, f)
+        total = total + f.value
+        if total >= target then break end
     end
     return picked, total
 end
@@ -389,7 +410,6 @@ local function ac_start()
         if not AC.collected[m] then AC.stats.total += 1 end
         AC.collected[m] = nil; AC.failCount[m] = nil
     end)
-    print("[AC] STARTED", ac_describeFolder())
     task.spawn(ac_scanAll)
 end
 
@@ -397,7 +417,6 @@ local function ac_stop()
     if AC.addedConn then AC.addedConn:Disconnect(); AC.addedConn = nil end
     if AC.removedConn then AC.removedConn:Disconnect(); AC.removedConn = nil end
     table.clear(AC.collected); table.clear(AC.failCount)
-    print("[AC] STOPPED")
 end
 
 task.spawn(function()
@@ -407,13 +426,51 @@ task.spawn(function()
     end
 end)
 
+-- =================== AUTO-FAVORITE ===================
+-- Favorites every (non-favorited) fruit whose value >= threshold.
+local AF = {
+    enabled = false,
+    threshold = 0,
+    stats = { run = 0, favs = 0, attempts = 0 },
+    INTERVAL = 8,  -- seconds between auto-scans
+}
+
+-- Favorites fruits above threshold. Returns (newlyFavorited, scanned, missingValues).
+-- 'lastFruitsRef' is the cached inventory list so we don't have to re-fetch bids.
+local function runAutoFavorite(lastFruitsRef, threshold)
+    local newFavs, scanned, unknown = 0, 0, 0
+    for _, f in ipairs(lastFruitsRef) do
+        scanned = scanned + 1
+        if f.value and f.value > 0 then
+            if f.value >= threshold and not f.favorited then
+                AF.stats.attempts = AF.stats.attempts + 1
+                local ok = callFavoriteRemote(f.id)
+                if ok then
+                    -- give the server a beat to reflect, then re-check the attribute
+                    task.wait(0.1)
+                    if f.tool and f.tool.Parent and isFavorited(f.tool) then
+                        f.favorited = true
+                        newFavs = newFavs + 1
+                        AF.stats.favs = AF.stats.favs + 1
+                    end
+                end
+                task.wait(0.2)  -- rate-limit
+            end
+        else
+            unknown = unknown + 1
+        end
+    end
+    AF.stats.run = AF.stats.run + 1
+    return newFavs, scanned, unknown
+end
+
 -- =================== UI ===================
 
 local W, H
 if IS_MOBILE then
-    W, H = 360, 620
+    W, H = 360, 720
 else
-    W, H = 520, 800
+    W, H = 520, 880
 end
 
 local FS_TITLE   = IS_MOBILE and 14 or 15
@@ -432,7 +489,7 @@ gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.IgnoreGuiInset = true
 gui.Parent = LocalPlayer.PlayerGui
 
--- =========== FLOATING MINIMIZED BUBBLE ===========
+-- bubble
 local bubble = Instance.new("TextButton")
 bubble.Name = "Bubble"
 bubble.Size = UDim2.new(0, 56, 0, 56)
@@ -449,12 +506,8 @@ bubble.Active = true
 bubble.Draggable = true
 bubble.Parent = gui
 Instance.new("UICorner", bubble).CornerRadius = UDim.new(1, 0)
-local bubbleStroke = Instance.new("UIStroke", bubble)
-bubbleStroke.Color = Color3.fromRGB(255,255,255)
-bubbleStroke.Thickness = 2
-bubbleStroke.Transparency = 0.4
 
--- =========== MAIN WINDOW ===========
+-- main
 local main = Instance.new("Frame")
 main.Name = "Main"
 main.Size = UDim2.new(0, W, 0, H)
@@ -508,22 +561,12 @@ local refreshBtn = makeTitleBtn("🔄", -110, Color3.fromRGB(70,130,200))
 local copyBtn    = makeTitleBtn("📋", -146, Color3.fromRGB(120,90,200))
 
 closeBtn.MouseButton1Click:Connect(function()
-    AC.enabled = false; ac_stop(); gui:Destroy()
+    AC.enabled = false; ac_stop(); AF.enabled = false; gui:Destroy()
 end)
+minBtn.MouseButton1Click:Connect(function() main.Visible = false; bubble.Visible = true end)
+bubble.MouseButton1Click:Connect(function() bubble.Visible = false; main.Visible = true end)
 
-local function minimize()
-    main.Visible = false
-    bubble.Visible = true
-end
-local function restore()
-    bubble.Visible = false
-    main.Visible = true
-end
-
-minBtn.MouseButton1Click:Connect(minimize)
-bubble.MouseButton1Click:Connect(restore)
-
--- =========== SEARCH ===========
+-- search
 local searchFrame = Instance.new("Frame")
 searchFrame.Size = UDim2.new(1, -20, 0, 30)
 searchFrame.Position = UDim2.new(0, 10, 0, 50)
@@ -546,11 +589,12 @@ searchBox.TextXAlignment = Enum.TextXAlignment.Left
 searchBox.ClearTextOnFocus = false
 searchBox.Parent = searchFrame
 
--- =========== AUTO DROP PANEL ===========
-local DROP_PANEL_H = 150
+-- ================ DROP PANEL ================
+local DROP_PANEL_Y = 86
+local DROP_PANEL_H = 192
 local dropPanel = Instance.new("Frame")
 dropPanel.Size = UDim2.new(1, -20, 0, DROP_PANEL_H)
-dropPanel.Position = UDim2.new(0, 10, 0, 86)
+dropPanel.Position = UDim2.new(0, 10, 0, DROP_PANEL_Y)
 dropPanel.BackgroundColor3 = Color3.fromRGB(30,33,42)
 dropPanel.BorderSizePixel = 0
 dropPanel.Parent = main
@@ -560,7 +604,7 @@ local dropTitle = Instance.new("TextLabel")
 dropTitle.Size = UDim2.new(1, -160, 0, 18)
 dropTitle.Position = UDim2.new(0, 10, 0, 4)
 dropTitle.BackgroundTransparency = 1
-dropTitle.Text = "💧 Auto Drop"
+dropTitle.Text = "💧 Auto Drop (skips ⭐ favorites)"
 dropTitle.TextColor3 = Color3.fromRGB(180,200,255)
 dropTitle.Font = Enum.Font.GothamBold
 dropTitle.TextSize = FS_BODY
@@ -578,9 +622,56 @@ floorLabel.TextSize = FS_SMALL
 floorLabel.TextXAlignment = Enum.TextXAlignment.Right
 floorLabel.Parent = dropPanel
 
--- Row 1: by VALUE
-local row1Y = 26
+-- Direction toggle row
+local DIR = { value = "asc" }  -- "asc" = low→high, "desc" = high→low
+
 local availW = W - 40
+local dirBtnW = math.floor((availW - 6) / 2)
+local rowDirY = 26
+
+local dirAscBtn = Instance.new("TextButton")
+dirAscBtn.Size = UDim2.new(0, dirBtnW, 0, BTN_H)
+dirAscBtn.Position = UDim2.new(0, 10, 0, rowDirY)
+dirAscBtn.BackgroundColor3 = Color3.fromRGB(70,130,200)
+dirAscBtn.BorderSizePixel = 0
+dirAscBtn.Text = "▲ Low → High"
+dirAscBtn.TextColor3 = Color3.fromRGB(255,255,255)
+dirAscBtn.Font = Enum.Font.GothamBold
+dirAscBtn.TextSize = FS_BTN
+dirAscBtn.Parent = dropPanel
+Instance.new("UICorner", dirAscBtn).CornerRadius = UDim.new(0, 4)
+
+local dirDescBtn = Instance.new("TextButton")
+dirDescBtn.Size = UDim2.new(0, dirBtnW, 0, BTN_H)
+dirDescBtn.Position = UDim2.new(0, 10 + dirBtnW + 6, 0, rowDirY)
+dirDescBtn.BackgroundColor3 = Color3.fromRGB(55,60,70)
+dirDescBtn.BorderSizePixel = 0
+dirDescBtn.Text = "▼ High → Low"
+dirDescBtn.TextColor3 = Color3.fromRGB(225,225,230)
+dirDescBtn.Font = Enum.Font.GothamBold
+dirDescBtn.TextSize = FS_BTN
+dirDescBtn.Parent = dropPanel
+Instance.new("UICorner", dirDescBtn).CornerRadius = UDim.new(0, 4)
+
+local function setDir(d)
+    DIR.value = d
+    if d == "asc" then
+        dirAscBtn.BackgroundColor3  = Color3.fromRGB(70,130,200)
+        dirAscBtn.TextColor3        = Color3.fromRGB(255,255,255)
+        dirDescBtn.BackgroundColor3 = Color3.fromRGB(55,60,70)
+        dirDescBtn.TextColor3       = Color3.fromRGB(225,225,230)
+    else
+        dirDescBtn.BackgroundColor3 = Color3.fromRGB(200,90,90)
+        dirDescBtn.TextColor3       = Color3.fromRGB(255,255,255)
+        dirAscBtn.BackgroundColor3  = Color3.fromRGB(55,60,70)
+        dirAscBtn.TextColor3        = Color3.fromRGB(225,225,230)
+    end
+end
+dirAscBtn.MouseButton1Click:Connect(function() setDir("asc") end)
+dirDescBtn.MouseButton1Click:Connect(function() setDir("desc") end)
+
+-- Row by VALUE
+local row1Y = rowDirY + BTN_H + 6
 local targetW = math.floor(availW * 0.42)
 local delayW  = math.floor(availW * 0.22)
 local dropBtnW = availW - targetW - delayW - 12
@@ -627,7 +718,7 @@ dropBtn.TextSize = FS_BTN
 dropBtn.Parent = dropPanel
 Instance.new("UICorner", dropBtn).CornerRadius = UDim.new(0, 4)
 
--- Row 2: by COUNT (lowest first)
+-- Row by COUNT
 local row2Y = row1Y + BTN_H + 6
 local countW = math.floor(availW * 0.42)
 local countBtnW = availW - countW - 6
@@ -652,7 +743,7 @@ dropNBtn.Size = UDim2.new(0, countBtnW, 0, BTN_H)
 dropNBtn.Position = UDim2.new(0, 10 + countW + 6, 0, row2Y)
 dropNBtn.BackgroundColor3 = Color3.fromRGB(200,140,60)
 dropNBtn.BorderSizePixel = 0
-dropNBtn.Text = "DROP N (low→high)"
+dropNBtn.Text = "DROP N"
 dropNBtn.TextColor3 = Color3.fromRGB(255,255,255)
 dropNBtn.Font = Enum.Font.GothamBold
 dropNBtn.TextSize = FS_BTN
@@ -679,10 +770,87 @@ task.spawn(function()
     end
 end)
 
--- =========== AUTO COLLECT PANEL ===========
-local AC_PANEL_Y = 86 + DROP_PANEL_H + 8
+-- ================ AUTO-FAVORITE PANEL ================
+local FAV_PANEL_Y = DROP_PANEL_Y + DROP_PANEL_H + 8
+local FAV_PANEL_H = 86
+local favPanel = Instance.new("Frame")
+favPanel.Size = UDim2.new(1, -20, 0, FAV_PANEL_H)
+favPanel.Position = UDim2.new(0, 10, 0, FAV_PANEL_Y)
+favPanel.BackgroundColor3 = Color3.fromRGB(30,33,42)
+favPanel.BorderSizePixel = 0
+favPanel.Parent = main
+Instance.new("UICorner", favPanel).CornerRadius = UDim.new(0, 5)
+
+local favTitle = Instance.new("TextLabel")
+favTitle.Size = UDim2.new(1, -20, 0, 18)
+favTitle.Position = UDim2.new(0, 10, 0, 4)
+favTitle.BackgroundTransparency = 1
+favTitle.Text = "⭐ Auto-Favorite (value ≥ threshold)"
+favTitle.TextColor3 = Color3.fromRGB(255,225,120)
+favTitle.Font = Enum.Font.GothamBold
+favTitle.TextSize = FS_BODY
+favTitle.TextXAlignment = Enum.TextXAlignment.Left
+favTitle.Parent = favPanel
+
+local favThreshW = math.floor(availW * 0.36)
+local favApplyW  = math.floor(availW * 0.28)
+local favAutoW   = availW - favThreshW - favApplyW - 12
+
+local favThreshBox = Instance.new("TextBox")
+favThreshBox.Size = UDim2.new(0, favThreshW, 0, BTN_H)
+favThreshBox.Position = UDim2.new(0, 10, 0, 28)
+favThreshBox.BackgroundColor3 = Color3.fromRGB(40,43,52)
+favThreshBox.BorderSizePixel = 0
+favThreshBox.PlaceholderText = "Threshold (10m)"
+favThreshBox.PlaceholderColor3 = Color3.fromRGB(110,115,125)
+favThreshBox.Text = ""
+favThreshBox.TextColor3 = Color3.fromRGB(230,230,235)
+favThreshBox.Font = Enum.Font.Gotham
+favThreshBox.TextSize = FS_BTN
+favThreshBox.ClearTextOnFocus = false
+favThreshBox.Parent = favPanel
+Instance.new("UICorner", favThreshBox).CornerRadius = UDim.new(0, 4)
+
+local favApplyBtn = Instance.new("TextButton")
+favApplyBtn.Size = UDim2.new(0, favApplyW, 0, BTN_H)
+favApplyBtn.Position = UDim2.new(0, 10 + favThreshW + 6, 0, 28)
+favApplyBtn.BackgroundColor3 = Color3.fromRGB(220,170,60)
+favApplyBtn.BorderSizePixel = 0
+favApplyBtn.Text = "Favorite Now"
+favApplyBtn.TextColor3 = Color3.fromRGB(40,30,10)
+favApplyBtn.Font = Enum.Font.GothamBold
+favApplyBtn.TextSize = FS_BTN
+favApplyBtn.Parent = favPanel
+Instance.new("UICorner", favApplyBtn).CornerRadius = UDim.new(0, 4)
+
+local favAutoBtn = Instance.new("TextButton")
+favAutoBtn.Size = UDim2.new(0, favAutoW, 0, BTN_H)
+favAutoBtn.Position = UDim2.new(0, 10 + favThreshW + 6 + favApplyW + 6, 0, 28)
+favAutoBtn.BackgroundColor3 = Color3.fromRGB(55,60,70)
+favAutoBtn.BorderSizePixel = 0
+favAutoBtn.Text = "AUTO: OFF"
+favAutoBtn.TextColor3 = Color3.fromRGB(225,225,230)
+favAutoBtn.Font = Enum.Font.GothamBold
+favAutoBtn.TextSize = FS_BTN
+favAutoBtn.Parent = favPanel
+Instance.new("UICorner", favAutoBtn).CornerRadius = UDim.new(0, 4)
+
+local favStatus = Instance.new("TextLabel")
+favStatus.Size = UDim2.new(1, -20, 0, 18)
+favStatus.Position = UDim2.new(0, 10, 0, 28 + BTN_H + 2)
+favStatus.BackgroundTransparency = 1
+favStatus.Text = "Idle"
+favStatus.TextColor3 = Color3.fromRGB(180,180,185)
+favStatus.Font = Enum.Font.Gotham
+favStatus.TextSize = FS_SMALL
+favStatus.TextXAlignment = Enum.TextXAlignment.Left
+favStatus.Parent = favPanel
+
+-- ================ AUTO COLLECT PANEL ================
+local AC_PANEL_Y = FAV_PANEL_Y + FAV_PANEL_H + 8
+local AC_PANEL_H = 76
 local acPanel = Instance.new("Frame")
-acPanel.Size = UDim2.new(1, -20, 0, 76)
+acPanel.Size = UDim2.new(1, -20, 0, AC_PANEL_H)
 acPanel.Position = UDim2.new(0, 10, 0, AC_PANEL_Y)
 acPanel.BackgroundColor3 = Color3.fromRGB(30,33,42)
 acPanel.BorderSizePixel = 0
@@ -746,14 +914,16 @@ task.spawn(function()
             bubble.BackgroundColor3 = Color3.fromRGB(60,170,90)
         else
             acStatus.Text = "Idle  -  tap ON to start"
-            bubble.BackgroundColor3 = Color3.fromRGB(70,130,200)
+            if not AF.enabled then
+                bubble.BackgroundColor3 = Color3.fromRGB(70,130,200)
+            end
         end
         task.wait(0.5)
     end
 end)
 
--- =========== TABLE ===========
-local TABLE_Y = AC_PANEL_Y + 76 + 8
+-- ================ TABLE ================
+local TABLE_Y = AC_PANEL_Y + AC_PANEL_H + 8
 
 local header = Instance.new("Frame")
 header.Size = UDim2.new(1, -20, 0, 24)
@@ -816,7 +986,7 @@ footer.TextSize = FS_BODY
 footer.Parent = main
 Instance.new("UICorner", footer).CornerRadius = UDim.new(0, 5)
 
--- =========== ROWS ===========
+-- rows
 local mutationColors = {
     Electric = Color3.fromRGB(255,230,80), Gold = Color3.fromRGB(240,200,60),
     Rainbow = Color3.fromRGB(255,130,220), Frozen = Color3.fromRGB(120,200,255),
@@ -857,14 +1027,16 @@ local function buildRow(fruit, index)
         return l
     end
 
+    local namePrefix = fruit.favorited and "⭐ " or ""
+
     if IS_MOBILE then
         cell(tostring(index)..".", 0, 0.08, Color3.fromRGB(150,155,165))
-        cell(fruit.name, 0.08, 0.40)
+        cell(namePrefix..fruit.name, 0.08, 0.40)
         cell(fruit.mutation, 0.48, 0.26, mutationColors[fruit.mutation])
         cell(NumberUtils.Abbreviate(fruit.value), 0.74, 0.26, Color3.fromRGB(120,220,140))
     else
         cell(tostring(index)..".", 0, 0.06, Color3.fromRGB(150,155,165))
-        cell(fruit.name, 0.06, 0.34)
+        cell(namePrefix..fruit.name, 0.06, 0.34)
         cell(string.format("%.2fkg", fruit.weight), 0.40, 0.16)
         cell(fruit.mutation, 0.56, 0.22, mutationColors[fruit.mutation])
         cell(NumberUtils.Abbreviate(fruit.value), 0.78, 0.22, Color3.fromRGB(120,220,140))
@@ -897,7 +1069,7 @@ searchBox:GetPropertyChangedSignal("Text"):Connect(function()
     end
 end)
 
--- =========== REFRESH ===========
+-- ================ REFRESH ================
 local isRefreshing = false
 local function refresh()
     if isRefreshing then return end
@@ -938,14 +1110,15 @@ local function refresh()
     table.sort(fruits, function(a,b) return a.value > b.value end)
     lastFruits = fruits
 
-    local sum = 0
+    local sum, favs = 0, 0
     for i, fruit in ipairs(fruits) do
         buildRow(fruit, i)
         sum = sum + fruit.value
+        if fruit.favorited then favs = favs + 1 end
     end
 
-    footer.Text = string.format("TOTAL: %d  |  %s",
-        total, NumberUtils.Abbreviate(sum))
+    footer.Text = string.format("TOTAL: %d  (%d ⭐)  |  %s",
+        total, favs, NumberUtils.Abbreviate(sum))
 
     refreshBtn.Text = "🔄"
     refreshBtn.BackgroundColor3 = Color3.fromRGB(70,130,200)
@@ -954,12 +1127,12 @@ end
 
 refreshBtn.MouseButton1Click:Connect(refresh)
 
--- =========== SHARED DROP RUNNER ===========
+-- ================ DROP RUNNER ================
 local isDropping = false
 
 local function runDrop(picked, plannedTotal, label)
     if #picked == 0 then
-        dropStatus.Text = "No droppable fruits."
+        dropStatus.Text = "No droppable fruits (favorites are skipped)."
         return
     end
 
@@ -972,45 +1145,52 @@ local function runDrop(picked, plannedTotal, label)
     dropBtn.BackgroundColor3  = Color3.fromRGB(100,100,110)
     dropNBtn.BackgroundColor3 = Color3.fromRGB(100,100,110)
 
-    dropStatus.Text = string.format("[%s] Plan: %d fruits = %s",
-        label, #picked, NumberUtils.Abbreviate(plannedTotal))
+    local dirLabel = (DIR.value == "asc") and "↑" or "↓"
+    dropStatus.Text = string.format("[%s %s] Plan: %d fruits = %s",
+        label, dirLabel, #picked, NumberUtils.Abbreviate(plannedTotal))
 
     task.spawn(function()
         local dropped, droppedValue, failed = 0, 0, 0
         for _, f in ipairs(picked) do
-            local floorN = countFloorFruits()
-            if floorN >= FLOOR_LIMIT then
-                dropStatus.Text = string.format("Floor full. Waiting...")
-                local ok2 = waitForFloorSpace(function(n)
-                    dropStatus.Text = string.format("Floor %d/%d. Waiting...  [%d/%d]",
-                        n, FLOOR_LIMIT, dropped, #picked)
-                end, 120)
-                if not ok2 then
-                    dropStatus.Text = string.format("Timeout at %d/%d.", dropped, #picked)
-                    break
-                end
-            end
-
-            local ok = dropFruit(f)
-            if ok then
-                dropped = dropped + 1
-                droppedValue = droppedValue + (f.value or 0)
-                dropStatus.Text = string.format("[%s] %d/%d  (%s)  Floor:%d/%d",
-                    label, dropped, #picked, NumberUtils.Abbreviate(droppedValue),
-                    countFloorFruits(), FLOOR_LIMIT)
+            -- defensive: skip if got favorited mid-run
+            if f.favorited or (f.tool and f.tool.Parent and isFavorited(f.tool)) then
+                f.favorited = true
             else
-                failed = failed + 1
-                dropStatus.Text = string.format("Throttled - skipped %s  [%d ok / %d fail]",
-                    f.name, dropped, failed)
-                task.wait(1.0)
+                local floorN = countFloorFruits()
+                if floorN >= FLOOR_LIMIT then
+                    dropStatus.Text = "Floor full. Waiting..."
+                    local ok2 = waitForFloorSpace(function(n)
+                        dropStatus.Text = string.format("Floor %d/%d. Waiting...  [%d/%d]",
+                            n, FLOOR_LIMIT, dropped, #picked)
+                    end, 120)
+                    if not ok2 then
+                        dropStatus.Text = string.format("Timeout at %d/%d.", dropped, #picked)
+                        break
+                    end
+                end
+
+                local ok = dropFruit(f)
+                if ok then
+                    dropped = dropped + 1
+                    droppedValue = droppedValue + (f.value or 0)
+                    dropStatus.Text = string.format("[%s %s] %d/%d  (%s)  Floor:%d/%d",
+                        label, dirLabel, dropped, #picked,
+                        NumberUtils.Abbreviate(droppedValue),
+                        countFloorFruits(), FLOOR_LIMIT)
+                else
+                    failed = failed + 1
+                    dropStatus.Text = string.format("Throttled - %s  [%d ok / %d fail]",
+                        f.name, dropped, failed)
+                    task.wait(1.0)
+                end
+                task.wait(perDrop)
             end
-            task.wait(perDrop)
         end
         dropStatus.Text = string.format("Done! %d ok, %d failed = %s",
             dropped, failed, NumberUtils.Abbreviate(droppedValue))
 
         dropBtn.Text  = "DROP $"
-        dropNBtn.Text = "DROP N (low→high)"
+        dropNBtn.Text = "DROP N"
         dropBtn.BackgroundColor3  = Color3.fromRGB(80,160,90)
         dropNBtn.BackgroundColor3 = Color3.fromRGB(200,140,60)
         isDropping = false
@@ -1018,7 +1198,7 @@ local function runDrop(picked, plannedTotal, label)
     end)
 end
 
--- =========== DROP BY VALUE ===========
+-- DROP BY VALUE
 dropBtn.MouseButton1Click:Connect(function()
     if isDropping then return end
     if #lastFruits == 0 then
@@ -1027,11 +1207,11 @@ dropBtn.MouseButton1Click:Connect(function()
     end
     local target = parseValue(targetBox.Text)
     if target <= 0 then dropStatus.Text = "Invalid target value."; return end
-    local picked, total = selectFruitsForTarget(lastFruits, target)
+    local picked, total = selectByValue(lastFruits, target, DIR.value)
     runDrop(picked, total, "VALUE")
 end)
 
--- =========== DROP BY COUNT (lowest first) ===========
+-- DROP BY COUNT
 dropNBtn.MouseButton1Click:Connect(function()
     if isDropping then return end
     if #lastFruits == 0 then
@@ -1044,30 +1224,107 @@ dropNBtn.MouseButton1Click:Connect(function()
         return
     end
     n = math.floor(n)
-    local picked, total = selectLowestN(lastFruits, n)
+    local picked, total = selectN(lastFruits, n, DIR.value)
     runDrop(picked, total, "COUNT")
 end)
 
--- =========== COPY ===========
+-- ================ AUTO-FAVORITE WIRING ================
+local isFavoriting = false
+
+local function doFavoriteRun()
+    if isFavoriting then return end
+    if #lastFruits == 0 then
+        favStatus.Text = "Refresh inventory first."
+        return
+    end
+    local thresh = parseValue(favThreshBox.Text)
+    if thresh <= 0 then
+        favStatus.Text = "Enter a threshold (e.g. 10m)."
+        return
+    end
+    AF.threshold = thresh
+    isFavoriting = true
+    favApplyBtn.Text = "..."
+    favApplyBtn.BackgroundColor3 = Color3.fromRGB(100,100,110)
+
+    task.spawn(function()
+        local newF, scanned, unknown = runAutoFavorite(lastFruits, thresh)
+        if newF == 0 and AF.stats.attempts > 0 and not _favRemoteCached then
+            favStatus.Text = "Could not find favorite remote. Game may need different name."
+        else
+            favStatus.Text = string.format("Favorited %d new  (scanned %d, %d unknown value)",
+                newF, scanned, unknown)
+        end
+        favApplyBtn.Text = "Favorite Now"
+        favApplyBtn.BackgroundColor3 = Color3.fromRGB(220,170,60)
+        isFavoriting = false
+        -- repaint table to show new stars
+        task.wait(0.2); refresh()
+    end)
+end
+
+favApplyBtn.MouseButton1Click:Connect(doFavoriteRun)
+
+favAutoBtn.MouseButton1Click:Connect(function()
+    AF.enabled = not AF.enabled
+    if AF.enabled then
+        local thresh = parseValue(favThreshBox.Text)
+        if thresh <= 0 then
+            AF.enabled = false
+            favStatus.Text = "Enter a threshold first (e.g. 10m)."
+            return
+        end
+        AF.threshold = thresh
+        favAutoBtn.Text = "AUTO: ON"
+        favAutoBtn.BackgroundColor3 = Color3.fromRGB(60,170,90)
+        favAutoBtn.TextColor3 = Color3.fromRGB(255,255,255)
+    else
+        favAutoBtn.Text = "AUTO: OFF"
+        favAutoBtn.BackgroundColor3 = Color3.fromRGB(55,60,70)
+        favAutoBtn.TextColor3 = Color3.fromRGB(225,225,230)
+    end
+end)
+
+-- background loop for AUTO favorite
+task.spawn(function()
+    while gui.Parent do
+        task.wait(AF.INTERVAL)
+        if AF.enabled and not isFavoriting and not isRefreshing and #lastFruits > 0 then
+            isFavoriting = true
+            task.spawn(function()
+                local newF = runAutoFavorite(lastFruits, AF.threshold)
+                if newF > 0 then
+                    favStatus.Text = string.format("[auto] favorited %d  (total run %d, favs %d)",
+                        newF, AF.stats.run, AF.stats.favs)
+                end
+                isFavoriting = false
+            end)
+        end
+    end
+end)
+
+-- ================ COPY ================
 copyBtn.MouseButton1Click:Connect(function()
     if #allRows == 0 then return end
     local lines = {}
-    table.insert(lines, string.format("%-4s %-22s %-9s %-12s %s","#","NAME","WEIGHT","MUTATION","VALUE"))
-    table.insert(lines, string.rep("-", 62))
+    table.insert(lines, string.format("%-4s %-3s %-22s %-9s %-12s %s","#","FV","NAME","WEIGHT","MUTATION","VALUE"))
+    table.insert(lines, string.rep("-", 66))
     local total = 0
     for i, entry in ipairs(allRows) do
         local f = entry.fruit
-        table.insert(lines, string.format("%-4s %-22s %-9s %-12s %s",
-            tostring(i)..".", f.name, string.format("%.2fkg", f.weight),
+        table.insert(lines, string.format("%-4s %-3s %-22s %-9s %-12s %s",
+            tostring(i)..".", f.favorited and "★" or " ",
+            f.name, string.format("%.2fkg", f.weight),
             f.mutation, NumberUtils.Abbreviate(f.value)))
         total = total + f.value
     end
-    table.insert(lines, string.rep("-", 62))
+    table.insert(lines, string.rep("-", 66))
     table.insert(lines, string.format("TOTAL: %d  |  %s", #allRows, NumberUtils.Abbreviate(total)))
     local output = table.concat(lines, "\n")
     pcall(function() if setclipboard then setclipboard(output) end end)
     pcall(function() if writefile then writefile("fruit-inventory-"..LocalPlayer.Name..".txt", output) end end)
 end)
 
+setDir("asc")
 refresh()
 print("[FruitToolkit] Loaded. Mobile:", IS_MOBILE)
