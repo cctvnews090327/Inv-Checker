@@ -94,6 +94,8 @@ local function dropFruit(fruit)
     local char = LocalPlayer.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     if not hum then return false end
+
+    -- unequip any other tools
     for _, t in ipairs(char:GetChildren()) do
         if t:IsA("Tool") and t ~= item then t.Parent = LocalPlayer.Backpack end
     end
@@ -101,10 +103,41 @@ local function dropFruit(fruit)
         pcall(function() hum:EquipTool(item) end)
         task.wait(0.1)
     end
-    VIM:SendKeyEvent(true, Enum.KeyCode.Backspace, false, game)
-    task.wait(0.03)
-    VIM:SendKeyEvent(false, Enum.KeyCode.Backspace, false, game)
-    return true
+
+    local fruitId = fruit.id
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+
+    local function stillHeld()
+        for _, t in ipairs(backpack:GetChildren()) do
+            if t:GetAttribute("Id") == fruitId then return true end
+        end
+        for _, t in ipairs(char:GetChildren()) do
+            if t:IsA("Tool") and t:GetAttribute("Id") == fruitId then return true end
+        end
+        return false
+    end
+
+    -- try up to 3 times, with growing waits between attempts
+    for attempt = 1, 3 do
+        VIM:SendKeyEvent(true,  Enum.KeyCode.Backspace, false, game)
+        task.wait(0.05)
+        VIM:SendKeyEvent(false, Enum.KeyCode.Backspace, false, game)
+
+        -- poll for ~1s to see if it actually left
+        local t0 = tick()
+        while tick() - t0 < 1.0 do
+            if not stillHeld() then return true end
+            task.wait(0.1)
+        end
+
+        -- still there → game throttled us. Re-equip and wait longer before retrying.
+        if item.Parent and item.Parent ~= char then
+            pcall(function() hum:EquipTool(item) end)
+        end
+        task.wait(0.6 * attempt)  -- 0.6s, 1.2s
+    end
+
+    return false
 end
 
 local function countFloorFruits()
@@ -899,8 +932,8 @@ dropBtn.MouseButton1Click:Connect(function()
         #picked, NumberUtils.Abbreviate(total))
     dropBtn.Text = "..."
 
-    task.spawn(function()
-        local dropped, droppedValue = 0, 0
+  task.spawn(function()
+        local dropped, droppedValue, failed = 0, 0, 0
         for _, f in ipairs(picked) do
             local floorN = countFloorFruits()
             if floorN >= FLOOR_LIMIT then
@@ -914,6 +947,29 @@ dropBtn.MouseButton1Click:Connect(function()
                     break
                 end
             end
+
+            local ok = dropFruit(f)
+            if ok then
+                dropped = dropped + 1
+                droppedValue = droppedValue + f.value
+                dropStatus.Text = string.format("Dropped %d/%d  (%s)  Floor:%d/%d",
+                    dropped, #picked, NumberUtils.Abbreviate(droppedValue),
+                    countFloorFruits(), FLOOR_LIMIT)
+            else
+                failed = failed + 1
+                dropStatus.Text = string.format("Throttled - skipped %s  [%d ok / %d fail]",
+                    f.name, dropped, failed)
+                task.wait(1.0)  -- extra cooldown after a confirmed throttle
+            end
+            task.wait(perDrop)
+        end
+        dropStatus.Text = string.format("Done! %d ok, %d failed = %s",
+            dropped, failed, NumberUtils.Abbreviate(droppedValue))
+        dropBtn.Text = "DROP"
+        dropBtn.BackgroundColor3 = Color3.fromRGB(80,160,90)
+        isDropping = false
+        task.wait(1); refresh()
+    end)
 
             local ok = dropFruit(f)
             if ok then
