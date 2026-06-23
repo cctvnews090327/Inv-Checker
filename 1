@@ -452,12 +452,12 @@ local function runFavoriteOp(lastFruitsRef, threshold, mode, myGen)
             AF.stats.attempts = AF.stats.attempts + 1
             local ok = callFavoriteRemote(f.id, newState)
             if ok then
-                task.wait(0.1)
+                task.wait(0.05)
                 f.favorited = newState
                 changed = changed + 1
                 AF.stats.favs = AF.stats.favs + 1
             end
-            task.wait(0.2)
+            task.wait(0.1)
         end
     end
     AF.stats.run = AF.stats.run + 1
