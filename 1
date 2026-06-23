@@ -15,13 +15,13 @@ local NumberUtils = require(ReplicatedStorage.SharedModules.NumberUtils)
 local FLOOR_LIMIT = 10
 local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.MouseEnabled
 
+-- Cancellation: bumping STOP.gen invalidates any in-flight long-running op.
+local STOP = { gen = 0 }
+local function bumpGen() STOP.gen = STOP.gen + 1; return STOP.gen end
+local function isStale(myGen) return STOP.gen ~= myGen end
+
 -- =================== FAVORITE HELPERS ===================
--- The exact remote name is game-version dependent. We try a few likely
--- candidates and remember which one worked.
-local FAV_REMOTE_CANDIDATES = {
-    "FavoriteFruit", "ToggleFavorite", "FavouriteFruit", "ToggleFavourite",
-    "SetFavorite", "FavoriteItem",
-}
+-- Confirmed remote: Networking.Backpack.SetFruitFavorite(fruitId, bool)
 local FAV_ATTR_CANDIDATES = { "Favorited", "IsFavorite", "Favorite", "Favourited", "IsFavourited" }
 
 local function getFavAttr(tool)
@@ -37,24 +37,12 @@ local function isFavorited(tool)
     return v == true
 end
 
-local _favRemoteCached = nil
-local function callFavoriteRemote(fruitId)
-    if _favRemoteCached then
-        local ok = pcall(function() _favRemoteCached:Fire(fruitId) end)
-        return ok
-    end
-    if not Networking.Backpack then return false end
-    for _, name in ipairs(FAV_REMOTE_CANDIDATES) do
-        local remote = Networking.Backpack[name]
-        if remote then
-            local ok = pcall(function() remote:Fire(fruitId) end)
-            if ok then
-                _favRemoteCached = remote
-                return true
-            end
-        end
-    end
-    return false
+local function callFavoriteRemote(fruitId, state)
+    if state == nil then state = true end
+    local ok = pcall(function()
+        Networking.Backpack.SetFruitFavorite:Fire(fruitId, state)
+    end)
+    return ok
 end
 
 -- =================== DATA ===================
@@ -435,33 +423,50 @@ local AF = {
     INTERVAL = 8,  -- seconds between auto-scans
 }
 
--- Favorites fruits above threshold. Returns (newlyFavorited, scanned, missingValues).
--- 'lastFruitsRef' is the cached inventory list so we don't have to re-fetch bids.
-local function runAutoFavorite(lastFruitsRef, threshold)
-    local newFavs, scanned, unknown = 0, 0, 0
+-- mode: "favorite" → favorite all fruits with value >= threshold
+--       "unfavorite_below" → unfavorite all favorited fruits with value < threshold
+--       "unfavorite_all" → unfavorite every favorited fruit
+local function runFavoriteOp(lastFruitsRef, threshold, mode, myGen)
+    local changed, scanned, unknown = 0, 0, 0
     for _, f in ipairs(lastFruitsRef) do
+        if myGen and isStale(myGen) then break end
         scanned = scanned + 1
-        if f.value and f.value > 0 then
-            if f.value >= threshold and not f.favorited then
-                AF.stats.attempts = AF.stats.attempts + 1
-                local ok = callFavoriteRemote(f.id)
-                if ok then
-                    -- give the server a beat to reflect, then re-check the attribute
-                    task.wait(0.1)
-                    if f.tool and f.tool.Parent and isFavorited(f.tool) then
-                        f.favorited = true
-                        newFavs = newFavs + 1
-                        AF.stats.favs = AF.stats.favs + 1
-                    end
-                end
-                task.wait(0.2)  -- rate-limit
+        local shouldAct, newState = false, nil
+        if mode == "favorite" then
+            if f.value and f.value > 0 and f.value >= threshold and not f.favorited then
+                shouldAct, newState = true, true
+            elseif not f.value or f.value <= 0 then
+                unknown = unknown + 1
             end
-        else
-            unknown = unknown + 1
+        elseif mode == "unfavorite_below" then
+            if f.favorited and f.value and f.value > 0 and f.value < threshold then
+                shouldAct, newState = true, false
+            elseif f.favorited and (not f.value or f.value <= 0) then
+                unknown = unknown + 1
+            end
+        elseif mode == "unfavorite_all" then
+            if f.favorited then shouldAct, newState = true, false end
+        end
+
+        if shouldAct then
+            AF.stats.attempts = AF.stats.attempts + 1
+            local ok = callFavoriteRemote(f.id, newState)
+            if ok then
+                task.wait(0.1)
+                f.favorited = newState
+                changed = changed + 1
+                AF.stats.favs = AF.stats.favs + 1
+            end
+            task.wait(0.2)
         end
     end
     AF.stats.run = AF.stats.run + 1
-    return newFavs, scanned, unknown
+    return changed, scanned, unknown
+end
+
+-- Back-compat shim used by the auto loop
+local function runAutoFavorite(lastFruitsRef, threshold)
+    return runFavoriteOp(lastFruitsRef, threshold, "favorite", nil)
 end
 
 -- =================== UI ===================
@@ -772,7 +777,7 @@ end)
 
 -- ================ AUTO-FAVORITE PANEL ================
 local FAV_PANEL_Y = DROP_PANEL_Y + DROP_PANEL_H + 8
-local FAV_PANEL_H = 86
+local FAV_PANEL_H = 140
 local favPanel = Instance.new("Frame")
 favPanel.Size = UDim2.new(1, -20, 0, FAV_PANEL_H)
 favPanel.Position = UDim2.new(0, 10, 0, FAV_PANEL_Y)
@@ -785,20 +790,22 @@ local favTitle = Instance.new("TextLabel")
 favTitle.Size = UDim2.new(1, -20, 0, 18)
 favTitle.Position = UDim2.new(0, 10, 0, 4)
 favTitle.BackgroundTransparency = 1
-favTitle.Text = "⭐ Auto-Favorite (value ≥ threshold)"
+favTitle.Text = "⭐ Auto-Favorite / Unfavorite"
 favTitle.TextColor3 = Color3.fromRGB(255,225,120)
 favTitle.Font = Enum.Font.GothamBold
 favTitle.TextSize = FS_BODY
 favTitle.TextXAlignment = Enum.TextXAlignment.Left
 favTitle.Parent = favPanel
 
+-- Row 1: threshold | Favorite ≥ | AUTO
+local favRow1Y = 28
 local favThreshW = math.floor(availW * 0.36)
 local favApplyW  = math.floor(availW * 0.28)
 local favAutoW   = availW - favThreshW - favApplyW - 12
 
 local favThreshBox = Instance.new("TextBox")
 favThreshBox.Size = UDim2.new(0, favThreshW, 0, BTN_H)
-favThreshBox.Position = UDim2.new(0, 10, 0, 28)
+favThreshBox.Position = UDim2.new(0, 10, 0, favRow1Y)
 favThreshBox.BackgroundColor3 = Color3.fromRGB(40,43,52)
 favThreshBox.BorderSizePixel = 0
 favThreshBox.PlaceholderText = "Threshold (10m)"
@@ -813,10 +820,10 @@ Instance.new("UICorner", favThreshBox).CornerRadius = UDim.new(0, 4)
 
 local favApplyBtn = Instance.new("TextButton")
 favApplyBtn.Size = UDim2.new(0, favApplyW, 0, BTN_H)
-favApplyBtn.Position = UDim2.new(0, 10 + favThreshW + 6, 0, 28)
+favApplyBtn.Position = UDim2.new(0, 10 + favThreshW + 6, 0, favRow1Y)
 favApplyBtn.BackgroundColor3 = Color3.fromRGB(220,170,60)
 favApplyBtn.BorderSizePixel = 0
-favApplyBtn.Text = "Favorite Now"
+favApplyBtn.Text = "Favorite ≥"
 favApplyBtn.TextColor3 = Color3.fromRGB(40,30,10)
 favApplyBtn.Font = Enum.Font.GothamBold
 favApplyBtn.TextSize = FS_BTN
@@ -825,7 +832,7 @@ Instance.new("UICorner", favApplyBtn).CornerRadius = UDim.new(0, 4)
 
 local favAutoBtn = Instance.new("TextButton")
 favAutoBtn.Size = UDim2.new(0, favAutoW, 0, BTN_H)
-favAutoBtn.Position = UDim2.new(0, 10 + favThreshW + 6 + favApplyW + 6, 0, 28)
+favAutoBtn.Position = UDim2.new(0, 10 + favThreshW + 6 + favApplyW + 6, 0, favRow1Y)
 favAutoBtn.BackgroundColor3 = Color3.fromRGB(55,60,70)
 favAutoBtn.BorderSizePixel = 0
 favAutoBtn.Text = "AUTO: OFF"
@@ -835,9 +842,38 @@ favAutoBtn.TextSize = FS_BTN
 favAutoBtn.Parent = favPanel
 Instance.new("UICorner", favAutoBtn).CornerRadius = UDim.new(0, 4)
 
+-- Row 2: Unfavorite < threshold | Unfavorite ALL
+local favRow2Y = favRow1Y + BTN_H + 6
+local unfavBelowW = math.floor((availW - 6) * 0.55)
+local unfavAllW   = availW - unfavBelowW - 6
+
+local unfavBelowBtn = Instance.new("TextButton")
+unfavBelowBtn.Size = UDim2.new(0, unfavBelowW, 0, BTN_H)
+unfavBelowBtn.Position = UDim2.new(0, 10, 0, favRow2Y)
+unfavBelowBtn.BackgroundColor3 = Color3.fromRGB(150,90,180)
+unfavBelowBtn.BorderSizePixel = 0
+unfavBelowBtn.Text = "Unfavorite < threshold"
+unfavBelowBtn.TextColor3 = Color3.fromRGB(255,255,255)
+unfavBelowBtn.Font = Enum.Font.GothamBold
+unfavBelowBtn.TextSize = FS_BTN
+unfavBelowBtn.Parent = favPanel
+Instance.new("UICorner", unfavBelowBtn).CornerRadius = UDim.new(0, 4)
+
+local unfavAllBtn = Instance.new("TextButton")
+unfavAllBtn.Size = UDim2.new(0, unfavAllW, 0, BTN_H)
+unfavAllBtn.Position = UDim2.new(0, 10 + unfavBelowW + 6, 0, favRow2Y)
+unfavAllBtn.BackgroundColor3 = Color3.fromRGB(180,70,70)
+unfavAllBtn.BorderSizePixel = 0
+unfavAllBtn.Text = "Unfav ALL"
+unfavAllBtn.TextColor3 = Color3.fromRGB(255,255,255)
+unfavAllBtn.Font = Enum.Font.GothamBold
+unfavAllBtn.TextSize = FS_BTN
+unfavAllBtn.Parent = favPanel
+Instance.new("UICorner", unfavAllBtn).CornerRadius = UDim.new(0, 4)
+
 local favStatus = Instance.new("TextLabel")
 favStatus.Size = UDim2.new(1, -20, 0, 18)
-favStatus.Position = UDim2.new(0, 10, 0, 28 + BTN_H + 2)
+favStatus.Position = UDim2.new(0, 10, 0, favRow2Y + BTN_H + 2)
 favStatus.BackgroundTransparency = 1
 favStatus.Text = "Idle"
 favStatus.TextColor3 = Color3.fromRGB(180,180,185)
@@ -1125,7 +1161,27 @@ local function refresh()
     isRefreshing = false
 end
 
-refreshBtn.MouseButton1Click:Connect(refresh)
+refreshBtn.MouseButton1Click:Connect(function()
+    -- Cancel everything in-flight: bump generation, force-stop AC/AF loops.
+    bumpGen()
+    if AC.enabled then
+        AC.enabled = false
+        ac_stop()
+        acToggleBtn.Text = "OFF"
+        acToggleBtn.BackgroundColor3 = Color3.fromRGB(55,60,70)
+    end
+    if AF.enabled then
+        AF.enabled = false
+        favAutoBtn.Text = "AUTO: OFF"
+        favAutoBtn.BackgroundColor3 = Color3.fromRGB(55,60,70)
+        favAutoBtn.TextColor3 = Color3.fromRGB(225,225,230)
+    end
+    isDropping = false
+    isFavoriting = false
+    dropStatus.Text = "Stopped by refresh."
+    favStatus.Text  = "Stopped by refresh."
+    refresh()
+end)
 
 -- ================ DROP RUNNER ================
 local isDropping = false
@@ -1149,9 +1205,15 @@ local function runDrop(picked, plannedTotal, label)
     dropStatus.Text = string.format("[%s %s] Plan: %d fruits = %s",
         label, dirLabel, #picked, NumberUtils.Abbreviate(plannedTotal))
 
+    local myGen = STOP.gen
+
     task.spawn(function()
         local dropped, droppedValue, failed = 0, 0, 0
         for _, f in ipairs(picked) do
+            if isStale(myGen) then
+                dropStatus.Text = string.format("Cancelled at %d/%d.", dropped, #picked)
+                break
+            end
             -- defensive: skip if got favorited mid-run
             if f.favorited or (f.tool and f.tool.Parent and isFavorited(f.tool)) then
                 f.favorited = true
@@ -1160,16 +1222,26 @@ local function runDrop(picked, plannedTotal, label)
                 if floorN >= FLOOR_LIMIT then
                     dropStatus.Text = "Floor full. Waiting..."
                     local ok2 = waitForFloorSpace(function(n)
+                        if isStale(myGen) then return end
                         dropStatus.Text = string.format("Floor %d/%d. Waiting...  [%d/%d]",
                             n, FLOOR_LIMIT, dropped, #picked)
                     end, 120)
+                    if isStale(myGen) then
+                        dropStatus.Text = string.format("Cancelled at %d/%d.", dropped, #picked)
+                        break
+                    end
                     if not ok2 then
                         dropStatus.Text = string.format("Timeout at %d/%d.", dropped, #picked)
                         break
                     end
                 end
 
+                if isStale(myGen) then break end
                 local ok = dropFruit(f)
+                if isStale(myGen) then
+                    dropStatus.Text = string.format("Cancelled at %d/%d.", dropped, #picked)
+                    break
+                end
                 if ok then
                     dropped = dropped + 1
                     droppedValue = droppedValue + (f.value or 0)
@@ -1186,15 +1258,17 @@ local function runDrop(picked, plannedTotal, label)
                 task.wait(perDrop)
             end
         end
-        dropStatus.Text = string.format("Done! %d ok, %d failed = %s",
-            dropped, failed, NumberUtils.Abbreviate(droppedValue))
+        if not isStale(myGen) then
+            dropStatus.Text = string.format("Done! %d ok, %d failed = %s",
+                dropped, failed, NumberUtils.Abbreviate(droppedValue))
+        end
 
         dropBtn.Text  = "DROP $"
         dropNBtn.Text = "DROP N"
         dropBtn.BackgroundColor3  = Color3.fromRGB(80,160,90)
         dropNBtn.BackgroundColor3 = Color3.fromRGB(200,140,60)
         isDropping = false
-        task.wait(1); refresh()
+        if not isStale(myGen) then task.wait(1); refresh() end
     end)
 end
 
@@ -1231,39 +1305,51 @@ end)
 -- ================ AUTO-FAVORITE WIRING ================
 local isFavoriting = false
 
-local function doFavoriteRun()
+local function doFavOp(mode, needsThreshold, label, btn, origColor)
     if isFavoriting then return end
     if #lastFruits == 0 then
         favStatus.Text = "Refresh inventory first."
         return
     end
-    local thresh = parseValue(favThreshBox.Text)
-    if thresh <= 0 then
-        favStatus.Text = "Enter a threshold (e.g. 10m)."
-        return
+    local thresh = 0
+    if needsThreshold then
+        thresh = parseValue(favThreshBox.Text)
+        if thresh <= 0 then
+            favStatus.Text = "Enter a threshold (e.g. 10m)."
+            return
+        end
+        AF.threshold = thresh
     end
-    AF.threshold = thresh
     isFavoriting = true
-    favApplyBtn.Text = "..."
-    favApplyBtn.BackgroundColor3 = Color3.fromRGB(100,100,110)
+    local origText = btn.Text
+    btn.Text = "..."
+    btn.BackgroundColor3 = Color3.fromRGB(100,100,110)
+    local myGen = STOP.gen
 
     task.spawn(function()
-        local newF, scanned, unknown = runAutoFavorite(lastFruits, thresh)
-        if newF == 0 and AF.stats.attempts > 0 and not _favRemoteCached then
-            favStatus.Text = "Could not find favorite remote. Game may need different name."
+        local changed, scanned, unknown = runFavoriteOp(lastFruits, thresh, mode, myGen)
+        if not isStale(myGen) then
+            favStatus.Text = string.format("[%s] %d changed  (scanned %d, %d unknown)",
+                label, changed, scanned, unknown)
         else
-            favStatus.Text = string.format("Favorited %d new  (scanned %d, %d unknown value)",
-                newF, scanned, unknown)
+            favStatus.Text = string.format("[%s] cancelled (%d done)", label, changed)
         end
-        favApplyBtn.Text = "Favorite Now"
-        favApplyBtn.BackgroundColor3 = Color3.fromRGB(220,170,60)
+        btn.Text = origText
+        btn.BackgroundColor3 = origColor
         isFavoriting = false
-        -- repaint table to show new stars
-        task.wait(0.2); refresh()
+        if not isStale(myGen) then task.wait(0.2); refresh() end
     end)
 end
 
-favApplyBtn.MouseButton1Click:Connect(doFavoriteRun)
+favApplyBtn.MouseButton1Click:Connect(function()
+    doFavOp("favorite", true, "FAV ≥", favApplyBtn, Color3.fromRGB(220,170,60))
+end)
+unfavBelowBtn.MouseButton1Click:Connect(function()
+    doFavOp("unfavorite_below", true, "UNFAV <", unfavBelowBtn, Color3.fromRGB(150,90,180))
+end)
+unfavAllBtn.MouseButton1Click:Connect(function()
+    doFavOp("unfavorite_all", false, "UNFAV ALL", unfavAllBtn, Color3.fromRGB(180,70,70))
+end)
 
 favAutoBtn.MouseButton1Click:Connect(function()
     AF.enabled = not AF.enabled
@@ -1291,9 +1377,10 @@ task.spawn(function()
         task.wait(AF.INTERVAL)
         if AF.enabled and not isFavoriting and not isRefreshing and #lastFruits > 0 then
             isFavoriting = true
+            local myGen = STOP.gen
             task.spawn(function()
-                local newF = runAutoFavorite(lastFruits, AF.threshold)
-                if newF > 0 then
+                local newF = runFavoriteOp(lastFruits, AF.threshold, "favorite", myGen)
+                if newF > 0 and not isStale(myGen) then
                     favStatus.Text = string.format("[auto] favorited %d  (total run %d, favs %d)",
                         newF, AF.stats.run, AF.stats.favs)
                 end
